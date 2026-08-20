@@ -1,0 +1,11 @@
+model = vol_exp
+kind = exp
+intercept = -0.396615715508665
+n_mid_moves_30s = 0.004462333229111275
+n_mid_moves_60s = 0.0003356169775217293
+rv_30s = 0.03654036243919526
+rv_60s = -0.001237225024317959
+scale = 1
+clip_min = 0.05
+clip_max = 0.48
+sl = opposite
