@@ -117,10 +117,10 @@ private:
     static constexpr int kImbBins = 10;      // imbalance 分桶数
     static constexpr int kHorizon = 6;       // Stoikov 级数截断阶数
     static constexpr float kMidEps = 1e-8f;  // 判定 mid 未变的阈值
-    const float horizon = 13;
-    const bool enable_dynamic_risk_management = true;
-    const float tp_offset = 0.08f; // 静态止盈距离，与 trainer.TP_OFFSET 一致
-    float q_ord = 600;// in usdc
+    float horizon = 13.f; // 可由 model/param.mod 覆盖
+    bool enable_dynamic_risk_management = true;
+    float tp_offset = 0.08f; // 静态止盈距离；可由 param.mod 覆盖
+    float q_ord = 600.f; // USDC 名义；可由 param.mod 覆盖
     float tau = 0.407647f; // 从 T_Param.tau 加载，缺省回退
     position_manager position_;
 

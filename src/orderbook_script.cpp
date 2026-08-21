@@ -152,6 +152,17 @@ namespace
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         return value == "exp";
     }
+
+    bool parse_bool(std::string value, bool fallback = false)
+    {
+        for (char& c : value)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (value == "1" || value == "true" || value == "yes" || value == "on")
+            return true;
+        if (value == "0" || value == "false" || value == "no" || value == "off")
+            return false;
+        return fallback;
+    }
 }
 
 orderbook_script::orderbook_script() = default;
@@ -343,6 +354,34 @@ void orderbook_script::load_model_params()
 {
     t_coef_ = {};
     alpha_coef_ = {};
+
+    const std::string p_text = load_first({
+        "param.mod",
+        "model/param.mod",
+        "models/param.mod",
+        "../model/param.mod",
+    });
+    if (p_text.empty())
+        std::cerr << "param.mod not found; using built-in horizon/tp_offset/q_ord\n";
+    else
+    {
+        for_each_kv(p_text, [&](const std::string& key, const std::string& value)
+        {
+            if (key == "horizon")
+                horizon = parse_float(value, horizon);
+            else if (key == "tp_offset")
+                tp_offset = parse_float(value, tp_offset);
+            else if (key == "q_ord")
+                q_ord = parse_float(value, q_ord);
+            else if (key == "enable_dynamic_risk_management")
+                enable_dynamic_risk_management = parse_bool(value, enable_dynamic_risk_management);
+        });
+        std::cout << "loaded param.mod horizon=" << horizon
+                  << " tp_offset=" << tp_offset
+                  << " q_ord=" << q_ord
+                  << " enable_dynamic_risk_management="
+                  << (enable_dynamic_risk_management ? "true" : "false") << '\n';
+    }
 
     const std::string t_text = load_first({
         "T_Param",
