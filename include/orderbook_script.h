@@ -120,12 +120,13 @@ private:
     const float horizon = 13;
     const bool enable_dynamic_risk_management = true;
     const float tp_offset = 0.08f; // 静态止盈距离，与 trainer.TP_OFFSET 一致
-    float q_ord = 500;// in usdc
+    float q_ord = 600;// in usdc
     float tau = 0.407647f; // 从 T_Param.tau 加载，缺省回退
     position_manager position_;
 
     float tick_size = 0.f;
     float trade_tick_size_ = 0.f;
+    int trade_price_decimals_ = 2;
     uint32_t depth = 15;
     float obi = 0.f;
     float weighed_obi = 0.f;

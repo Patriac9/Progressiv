@@ -7,13 +7,14 @@ add_executable(Progressiv main.cpp
         src/Progressiv.cpp
         src/loader.cpp
         src/Binance_interface.cpp
+        src/ed25519.cpp
         src/orderbook_script.cpp
         src/script.cpp)
 
 target_include_directories(Progressiv PUBLIC ${CMAKE_SOURCE_DIR}/include)
 
 if (WIN32)
-    target_link_libraries(Progressiv PRIVATE winhttp ncrypt)
+    target_link_libraries(Progressiv PRIVATE winhttp)
     if (MINGW)
         target_link_libraries(Progressiv PRIVATE pthread)
 

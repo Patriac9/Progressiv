@@ -7,7 +7,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winhttp.h>
-#include <ncrypt.h>
 
 #include <algorithm>
 #include <atomic>
@@ -29,6 +28,7 @@
 #include <vector>
 
 #include "loader.h"
+#include "ed25519_sign.h"
 
 namespace
 {
@@ -107,11 +107,14 @@ namespace
         if (begin == std::string::npos || end == std::string::npos || end <= begin)
             throw std::runtime_error("Invalid Ed25519 PEM private key");
 
-        const auto base64_begin = pem.find('\n', begin);
-        if (base64_begin == std::string::npos || base64_begin >= end)
+        size_t i = begin;
+        while (i < end && pem[i] != '\n' && pem[i] != '\r')
+            ++i;
+        if (i >= end)
             throw std::runtime_error("Invalid Ed25519 PEM private key body");
-
-        return base64_decode(pem.substr(base64_begin, end - base64_begin));
+        while (i < end && (pem[i] == '\n' || pem[i] == '\r'))
+            ++i;
+        return base64_decode(pem.substr(i, end - i));
     }
 
     std::string json_escape(const std::string& s)
@@ -458,7 +461,36 @@ namespace
         return std::string(what) + " (GetLastError=" + std::to_string(GetLastError()) + ")";
     }
 
-    std::string https_get(const std::string& host, const std::string& path)
+    std::string url_encode(const std::string& s)
+    {
+        static const char kHex[] = "0123456789ABCDEF";
+        std::string out;
+        out.reserve(s.size() * 3);
+        for (unsigned char c : s)
+        {
+            if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~')
+                out.push_back(static_cast<char>(c));
+            else
+            {
+                out.push_back('%');
+                out.push_back(kHex[c >> 4]);
+                out.push_back(kHex[c & 15]);
+            }
+        }
+        return out;
+    }
+
+    struct HttpsResult
+    {
+        DWORD status = 0;
+        std::string body;
+    };
+
+    HttpsResult https_call(
+        const std::string& host,
+        const std::wstring& method,
+        const std::string& path,
+        const std::wstring& extra_headers = {})
     {
         const std::wstring whost = utf8_to_wide(host);
         const std::wstring wpath = utf8_to_wide(path);
@@ -488,7 +520,7 @@ namespace
 
         HINTERNET request = WinHttpOpenRequest(
             connect,
-            L"GET",
+            method.c_str(),
             wpath.c_str(),
             nullptr,
             WINHTTP_NO_REFERER,
@@ -501,13 +533,15 @@ namespace
             throw std::runtime_error(winerr("WinHttpOpenRequest failed"));
         }
 
-        if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
+        LPCWSTR headers = extra_headers.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : extra_headers.c_str();
+        const DWORD header_len = extra_headers.empty() ? 0 : static_cast<DWORD>(-1);
+        if (!WinHttpSendRequest(request, headers, header_len, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
             || !WinHttpReceiveResponse(request, nullptr))
         {
             WinHttpCloseHandle(request);
             WinHttpCloseHandle(connect);
             WinHttpCloseHandle(session);
-            throw std::runtime_error(winerr("HTTPS GET failed"));
+            throw std::runtime_error(winerr("HTTPS request failed"));
         }
 
         DWORD status_code = 0;
@@ -541,12 +575,32 @@ namespace
         WinHttpCloseHandle(connect);
         WinHttpCloseHandle(session);
 
-        if (status_code != 200)
-            throw std::runtime_error("HTTPS GET status " + std::to_string(status_code) + ": " + body);
-        return body;
+        HttpsResult result;
+        result.status = status_code;
+        result.body = std::move(body);
+        return result;
     }
 
-    float parse_price_filter_tick_size(const std::string& json)
+    std::string https_get(const std::string& host, const std::string& path)
+    {
+        const auto result = https_call(host, L"GET", path);
+        if (result.status != 200)
+            throw std::runtime_error("HTTPS GET status " + std::to_string(result.status) + ": " + result.body);
+        return result.body;
+    }
+
+    int tick_string_decimals(const std::string& s)
+    {
+        const auto dot = s.find('.');
+        if (dot == std::string::npos)
+            return 0;
+        size_t end = s.size();
+        while (end > dot + 1 && s[end - 1] == '0')
+            --end;
+        return static_cast<int>(end - dot - 1);
+    }
+
+    binance_interface::tick_filter parse_tick_filter(const std::string& json)
     {
         const auto filter_pos = json.find("\"PRICE_FILTER\"");
         if (filter_pos == std::string::npos)
@@ -566,7 +620,10 @@ namespace
             throw std::runtime_error("tickSize not found in PRICE_FILTER");
         try
         {
-            return std::stof(tick_size);
+            binance_interface::tick_filter f;
+            f.tick_size = std::stod(tick_size);
+            f.decimals = tick_string_decimals(tick_size);
+            return f;
         }
         catch (const std::exception&)
         {
@@ -799,11 +856,11 @@ struct binance_interface::RpcChannel
                             response = ws_recv(ws.socket);
                             if (response.empty())
                                 throw std::runtime_error("Empty RPC response");
-                            if (response.find("\"id\"") == std::string::npos
-                                || response.find(job.id) != std::string::npos)
-                            {
+                            const bool has_id = response.find("\"id\"") != std::string::npos;
+                            const bool id_match = response.find(job.id) != std::string::npos;
+                            const bool id_null = response.find("\"id\":null") != std::string::npos;
+                            if (!has_id || id_match || id_null)
                                 break;
-                            }
                         }
                         job.promise.set_value(std::move(response));
                     }
@@ -1209,17 +1266,28 @@ void binance_interface::init(std::string credential_path)
     if (last_end == std::string::npos)
     {
         testnet_line = remainder;
-        remainder.clear();
     }
     else
     {
         testnet_line = remainder.substr(last_end + 1);
-        remainder.resize(last_end);
-        if (!remainder.empty() && remainder.back() == '\r')
-            remainder.pop_back();
     }
     if (!testnet_line.empty() && testnet_line.back() == '\r')
         testnet_line.pop_back();
+
+    const bool last_is_flag = (testnet_line == "0" || testnet_line == "1"
+        || testnet_line == "true" || testnet_line == "TRUE"
+        || testnet_line == "false" || testnet_line == "FALSE");
+    if (last_is_flag)
+    {
+        if (last_end == std::string::npos)
+            remainder.clear();
+        else
+        {
+            remainder.resize(last_end);
+            if (!remainder.empty() && remainder.back() == '\r')
+                remainder.pop_back();
+        }
+    }
 
     use_testnet_ = (testnet_line == "1" || testnet_line == "true" || testnet_line == "TRUE");
     // 账户/下单仍走现货 WS API；行情与合约账户查询走 USD-M
@@ -1419,14 +1487,17 @@ std::vector<asset_balance> binance_interface::get_ws_balance(bool omit_zero_bala
     return parse_balances(response, omit_zero_balances);
 }
 
-float binance_interface::get_tick_size(std::string symbol)
+binance_interface::tick_filter binance_interface::get_tick_filter(std::string symbol)
 {
     symbol = resolve_symbol(std::move(symbol));
-    // USD-M 合约 exchangeInfo
     const std::string host = use_testnet_ ? "testnet.binancefuture.com" : "fapi.binance.com";
     const std::string path = "/fapi/v1/exchangeInfo?symbol=" + symbol;
-    const std::string json = https_get(host, path);
-    return parse_price_filter_tick_size(json);
+    return parse_tick_filter(https_get(host, path));
+}
+
+float binance_interface::get_tick_size(std::string symbol)
+{
+    return static_cast<float>(get_tick_filter(std::move(symbol)).tick_size);
 }
 
 order_info binance_interface::ws_place_order(const order_request& req)
@@ -1523,15 +1594,12 @@ std::vector<order_info> binance_interface::ws_open_orders(std::string symbol)
 {
     if (api_key_.empty() || private_key_pem_.empty())
         throw std::runtime_error("Binance API credentials are not set");
-    if (!futures_channel_)
-        throw std::runtime_error("futures channel not started; call start() first");
 
     param_map params;
     if (!symbol.empty())
         params["symbol"] = resolve_symbol(std::move(symbol));
 
-    const std::string response = signed_ws_call(*futures_channel_, "openOrders.status", std::move(params));
-    ensure_ws_ok(response, "openOrders.status");
+    const std::string response = signed_fapi_rest(L"GET", "/fapi/v1/openOrders", std::move(params));
     return parse_open_orders(response);
 }
 
@@ -1589,15 +1657,14 @@ std::vector<order_info> binance_interface::ws_cancel_all_open_orders(std::string
 {
     if (api_key_.empty() || private_key_pem_.empty())
         throw std::runtime_error("Binance API credentials are not set");
-    if (!futures_channel_)
-        throw std::runtime_error("futures channel not started; call start() first");
 
     param_map params;
     params["symbol"] = resolve_symbol(std::move(symbol));
 
-    const std::string response = signed_ws_call(*futures_channel_, "openOrders.cancelAll", std::move(params));
-    ensure_ws_ok(response, "openOrders.cancelAll");
-    return parse_open_orders(response);
+    const std::string response = signed_fapi_rest(L"DELETE", "/fapi/v1/allOpenOrders", std::move(params));
+    if (!response.empty() && response.front() == '[')
+        return parse_open_orders(response);
+    return {};
 }
 
 orderbook_info binance_interface::parse_orderbook(const std::string& json, const std::string& symbol)
@@ -1737,7 +1804,10 @@ order_info binance_interface::parse_order(const std::string& json)
 std::vector<order_info> binance_interface::parse_open_orders(const std::string& json)
 {
     std::vector<order_info> orders;
-    auto objs = extract_json_object_array(json, "result");
+    std::string payload = json;
+    if (!payload.empty() && payload.front() == '[')
+        payload = "{\"result\":" + payload + "}";
+    auto objs = extract_json_object_array(payload, "result");
     if (objs.empty())
     {
         // 个别环境下 result 可能是单对象
@@ -1807,7 +1877,15 @@ std::string binance_interface::signed_ws_call(RpcChannel& channel, const std::st
     }
     params["signature"] = ed25519_sign_base64(payload);
 
-    const std::string req_id = std::to_string(now_ms()) + "-" + method;
+    std::string req_id = std::to_string(now_ms()) + "-";
+    req_id.reserve(req_id.size() + method.size());
+    for (char c : method)
+    {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        req_id.push_back((std::isalnum(uc) || c == '-' || c == '_') ? c : '-');
+    }
+    if (req_id.size() > 36)
+        req_id.resize(36);
     std::ostringstream req;
     req << "{\"id\":\"" << json_escape(req_id) << "\",\"method\":\"" << json_escape(method) << "\",\"params\":{";
     bool first = true;
@@ -1827,6 +1905,37 @@ std::string binance_interface::signed_ws_call(RpcChannel& channel, const std::st
     return channel.call(req_id, req.str());
 }
 
+std::string binance_interface::signed_fapi_rest(const wchar_t* http_method, const std::string& path, param_map params) const
+{
+    params["timestamp"] = std::to_string(now_ms());
+
+    std::string payload;
+    for (const auto& [key, value] : params)
+    {
+        if (!payload.empty())
+            payload += '&';
+        payload += key;
+        payload += '=';
+        payload += value;
+    }
+    const std::string signature = ed25519_sign_base64(payload);
+    const std::string host = use_testnet_ ? "testnet.binancefuture.com" : "fapi.binance.com";
+    const std::string full_path = path + "?" + payload + "&signature=" + url_encode(signature);
+    const std::wstring headers = L"X-MBX-APIKEY: " + utf8_to_wide(api_key_) + L"\r\n";
+
+    const auto result = https_call(host, http_method, full_path, headers);
+
+    if (result.status != 200)
+        throw std::runtime_error(std::string("fapi REST ") + result.body);
+    if (!result.body.empty() && result.body.front() == '{')
+    {
+        const auto code = extract_json_int(result.body, "code");
+        if (code < 0)
+            throw std::runtime_error("fapi REST error: " + result.body);
+    }
+    return result.body;
+}
+
 long long binance_interface::now_ms()
 {
     using namespace std::chrono;
@@ -1836,64 +1945,8 @@ long long binance_interface::now_ms()
 std::string binance_interface::ed25519_sign_base64(const std::string& message) const
 {
     const auto der = pem_to_der(private_key_pem_);
-
-    NCRYPT_PROV_HANDLE provider = 0;
-    NCRYPT_KEY_HANDLE key = 0;
-
-    SECURITY_STATUS status = NCryptOpenStorageProvider(&provider, MS_KEY_STORAGE_PROVIDER, 0);
-    if (status != ERROR_SUCCESS)
-        throw std::runtime_error("NCryptOpenStorageProvider failed");
-
-    status = NCryptImportKey(
-        provider,
-        0,
-        NCRYPT_PKCS8_PRIVATE_KEY_BLOB,
-        nullptr,
-        &key,
-        const_cast<PBYTE>(der.data()),
-        static_cast<DWORD>(der.size()),
-        NCRYPT_SILENT_FLAG);
-    if (status != ERROR_SUCCESS)
-    {
-        NCryptFreeObject(provider);
-        throw std::runtime_error("Failed to import Ed25519 PKCS#8 private key");
-    }
-
-    DWORD sig_len = 0;
-    status = NCryptSignHash(
-        key,
-        nullptr,
-        reinterpret_cast<PBYTE>(const_cast<char*>(message.data())),
-        static_cast<DWORD>(message.size()),
-        nullptr,
-        0,
-        &sig_len,
-        NCRYPT_SILENT_FLAG);
-    if (status != ERROR_SUCCESS || sig_len == 0)
-    {
-        NCryptFreeObject(key);
-        NCryptFreeObject(provider);
-        throw std::runtime_error("NCryptSignHash size query failed");
-    }
-
-    std::vector<BYTE> signature(sig_len);
-    status = NCryptSignHash(
-        key,
-        nullptr,
-        reinterpret_cast<PBYTE>(const_cast<char*>(message.data())),
-        static_cast<DWORD>(message.size()),
-        signature.data(),
-        sig_len,
-        &sig_len,
-        NCRYPT_SILENT_FLAG);
-
-    NCryptFreeObject(key);
-    NCryptFreeObject(provider);
-
-    if (status != ERROR_SUCCESS)
-        throw std::runtime_error("Ed25519 NCryptSignHash failed");
-
-    return base64_encode(signature.data(), sig_len);
+    const auto seed = ed25519_seed_from_pkcs8_der(der);
+    return ed25519_sign_b64(seed, message);
 }
 
 std::vector<asset_balance> binance_interface::parse_balances(const std::string& json, bool omit_zero)

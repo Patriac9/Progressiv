@@ -150,8 +150,15 @@ public:
     // 经余额线程长连接发起 account.status
     std::vector<asset_balance> get_ws_balance(bool omit_zero_balances = true);
 
+    struct tick_filter
+    {
+        double tick_size = 0.01;
+        int decimals = 2; // tickSize 去掉尾零后的小数位，例如 "0.10" → 1
+    };
+
     // 查询交易对 tickSize（PRICE_FILTER）；symbol 为空时读 instId.cfg
     float get_tick_size(std::string symbol = {});
+    tick_filter get_tick_filter(std::string symbol = {});
 
     // 经 USD-M 合约 WS API（ws-fapi）：下单 / 改单 / 查单 / 撤单 / 持仓
     order_info ws_place_order(const order_request& req);
@@ -203,6 +210,7 @@ private:
     order_info modify_order_ws(param_map cancel_id_params, order_request req);
     std::string ed25519_sign_base64(const std::string& message) const;
     std::string signed_ws_call(RpcChannel& channel, const std::string& method, param_map params) const;
+    std::string signed_fapi_rest(const wchar_t* http_method, const std::string& path, param_map params) const;
     std::string resolve_symbol(std::string symbol) const;
 
     static std::vector<asset_balance> parse_balances(const std::string& json, bool omit_zero);

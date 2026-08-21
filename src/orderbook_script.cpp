@@ -22,25 +22,73 @@ namespace
         return oss.str();
     }
 
-    int decimals_from_tick(float tick)
+    long long pow10_ll(int n)
     {
-        if (tick <= 0.f)
-            return 2;
-        int dp = 0;
-        double t = static_cast<double>(tick);
-        while (dp < 8 && std::fabs(t - std::round(t)) > 1e-10)
-        {
-            t *= 10.0;
-            ++dp;
-        }
-        return dp;
+        long long p = 1;
+        for (int i = 0; i < n; ++i)
+            p *= 10;
+        return p;
     }
 
-    float round_to_tick(float x, float tick)
+    std::string format_units(long long units, int decimals)
     {
-        if (tick <= 0.f)
-            return x;
-        return std::round(x / tick) * tick;
+        if (decimals <= 0)
+            return std::to_string(units);
+        const bool neg = units < 0;
+        unsigned long long v = neg
+            ? static_cast<unsigned long long>(-units)
+            : static_cast<unsigned long long>(units);
+        std::string s = std::to_string(v);
+        if (static_cast<int>(s.size()) <= decimals)
+            s.insert(0, static_cast<size_t>(decimals + 1 - static_cast<int>(s.size())), '0');
+        s.insert(s.end() - decimals, '.');
+        if (neg)
+            s.insert(s.begin(), '-');
+        return s;
+    }
+
+    long long tick_index(double x, double tick, bool round_up)
+    {
+        if (tick <= 0.0)
+            return 0;
+        if (round_up)
+            return static_cast<long long>(std::ceil(x / tick - 1e-12));
+        return static_cast<long long>(std::floor(x / tick + 1e-12));
+    }
+
+    // 按 tick 整数格格式化，小数位不超过 tickSize（避免 float 四舍五入多出位数）
+    std::string format_tick_n(long long n, double tick, int decimals)
+    {
+        const long long scale = pow10_ll(std::max(0, decimals));
+        const long long tick_u = std::llround(tick * static_cast<double>(scale));
+        if (tick_u <= 0)
+            return format_decimal(static_cast<double>(n) * tick, decimals);
+        return format_units(n * tick_u, decimals);
+    }
+
+    std::string format_on_tick(double x, double tick, int decimals, bool round_up)
+    {
+        return format_tick_n(tick_index(x, tick, round_up), tick, decimals);
+    }
+
+    // 买单 floor 到买一，卖单 ceil 到卖一
+    bool same_side_bbo(bool is_buy, double bid, double ask, double tick, int decimals,
+                       std::string& px_str, double& px)
+    {
+        if (!(bid < ask) || bid <= 0.0 || ask <= 0.0 || tick <= 0.0)
+            return false;
+        const long long n = is_buy
+            ? tick_index(bid, tick, false)
+            : tick_index(ask, tick, true);
+        if (n <= 0)
+            return false;
+        px = static_cast<double>(n) * tick;
+        if (is_buy && !(px < ask))
+            return false;
+        if (!is_buy && !(px > bid))
+            return false;
+        px_str = format_tick_n(n, tick, decimals);
+        return true;
     }
 
     void trim_inplace(std::string& s)
@@ -153,7 +201,9 @@ void orderbook_script::init(std::string instId)
     tau = 0.407647f;
 
     tick_size = progressiv_ -> interface_ ->get_tick_size(instId);
-    trade_tick_size_ = progressiv_->interface_->get_tick_size(progressiv_->interface_->trade_symbol());
+    const auto tf = progressiv_->interface_->get_tick_filter(progressiv_->interface_->trade_symbol());
+    trade_tick_size_ = static_cast<float>(tf.tick_size);
+    trade_price_decimals_ = tf.decimals;
     load_model_params();
 }
 
@@ -922,20 +972,18 @@ void orderbook_script::run()
             {
                 const float bid = trade_book.bids.front().price;
                 const float ask = trade_book.asks.front().price;
-                const float px_tick = trade_tick_size_ > 0.f ? trade_tick_size_ : tick_size;
-                const int px_decimals = decimals_from_tick(px_tick);
+                const double px_tick = trade_tick_size_ > 0.f ? trade_tick_size_ : tick_size;
+                const int px_decimals = trade_price_decimals_;
 
-                auto place_post_only = [&](const char* side, float raw_px)
+                auto place_post_only = [&](const char* side)
                 {
-                    if (!(bid < ask) || raw_px <= 0.f)
-                        return;
-                    if (side[0] == 'B' && !(raw_px < ask))
-                        return;
-                    if (side[0] == 'S' && !(raw_px > bid))
+                    const bool is_buy = side[0] == 'B';
+                    std::string px_str;
+                    double px = 0.0;
+                    if (!same_side_bbo(is_buy, bid, ask, px_tick, px_decimals, px_str, px))
                         return;
 
-                    const float px = round_to_tick(raw_px, px_tick);
-                    float qty = q_ord / px;
+                    float qty = static_cast<float>(q_ord / px);
                     qty = std::floor(qty * 1000.f + 1e-6f) / 1000.f;
                     if (qty < 0.001f)
                         return;
@@ -945,7 +993,7 @@ void orderbook_script::run()
                     req.side = side;
                     req.type = "LIMIT";
                     req.time_in_force = "GTX";
-                    req.price = format_decimal(px, px_decimals);
+                    req.price = px_str;
                     req.quantity = format_decimal(qty, 3);
                     try
                     {
@@ -953,14 +1001,17 @@ void orderbook_script::run()
                     }
                     catch (const std::exception& ex)
                     {
-                        std::cerr << "post-only " << side << " rejected: " << ex.what() << '\n';
+                        std::cerr << "post-only " << side << " " << req.price
+                                  << " bid=" << format_on_tick(bid, px_tick, px_decimals, false)
+                                  << " ask=" << format_on_tick(ask, px_tick, px_decimals, true)
+                                  << " rejected: " << ex.what() << '\n';
                     }
                 };
 
                 if (std::abs(predicted_movement) >= tau && predicted_movement > 0) // long: 买挂买一
-                    place_post_only("BUY", bid);
+                    place_post_only("BUY");
                 else if (std::abs(predicted_movement) >= tau && predicted_movement < 0) // short: 卖挂卖一
-                    place_post_only("SELL", ask);
+                    place_post_only("SELL");
             }
         }
         else if (positions.empty() && !orders.empty())
@@ -971,8 +1022,8 @@ void orderbook_script::run()
             const bool is_buy = (o.side == "BUY" || o.position_side == "LONG");
             const bool is_sell = (o.side == "SELL" || o.position_side == "SHORT");
 
-            const float px_tick = trade_tick_size_ > 0.f ? trade_tick_size_ : tick_size;
-            const int px_decimals = decimals_from_tick(px_tick);
+            const double px_tick = trade_tick_size_ > 0.f ? trade_tick_size_ : tick_size;
+            const int px_decimals = trade_price_decimals_;
 
             auto trade_book = progressiv_->interface_->get_ws_trade_orderbook();
             if (trade_book.bids.empty() || trade_book.asks.empty())
@@ -996,32 +1047,26 @@ void orderbook_script::run()
                     const float ask = trade_book.asks.front().price;
                     float order_px = 0.f;
                     try { order_px = std::stof(o.price); } catch (...) {}
-                    if (std::fabs(bid - order_px) > px_tick * 0.5f && bid < ask)
+                    double px = 0.0;
+                    std::string px_str;
+                    if (same_side_bbo(true, bid, ask, px_tick, px_decimals, px_str, px)
+                        && std::fabs(px - order_px) > px_tick * 0.5)
                     {
-                        const float px = round_to_tick(bid, px_tick);
-                        if (px < ask)
+                        try
                         {
-                            float qty = q_ord / px;
-                            qty = std::floor(qty * 1000.f + 1e-6f) / 1000.f;
-                            if (qty >= 0.001f)
-                            {
-                                try
-                                {
-                                    progressiv_->interface_->ws_cancel_order(o.order_id, trade);
-                                    order_request req;
-                                    req.symbol = trade;
-                                    req.side = "BUY";
-                                    req.type = "LIMIT";
-                                    req.time_in_force = "GTX";
-                                    req.price = format_decimal(px, px_decimals);
-                                    req.quantity = format_decimal(qty, 3);
-                                    progressiv_->interface_->ws_place_order(req);
-                                }
-                                catch (const std::exception& ex)
-                                {
-                                    std::cerr << "reprice BUY rejected: " << ex.what() << '\n';
-                                }
-                            }
+                            order_request req;
+                            req.symbol = trade;
+                            req.side = "BUY";
+                            req.price = px_str;
+                            req.quantity = o.orig_qty.empty() ? format_decimal(std::floor((q_ord / px) * 1000.0 + 1e-6) / 1000.0, 3) : o.orig_qty;
+                            progressiv_->interface_->ws_modify_order(o.order_id, req);
+                        }
+                        catch (const std::exception& ex)
+                        {
+                            std::cerr << "reprice BUY " << px_str
+                                      << " bid=" << format_on_tick(bid, px_tick, px_decimals, false)
+                                      << " ask=" << format_on_tick(ask, px_tick, px_decimals, true)
+                                      << " rejected: " << ex.what() << '\n';
                         }
                     }
                 }
@@ -1045,32 +1090,26 @@ void orderbook_script::run()
                     const float ask = trade_book.asks.front().price;
                     float order_px = 0.f;
                     try { order_px = std::stof(o.price); } catch (...) {}
-                    if (std::fabs(ask - order_px) > px_tick * 0.5f && bid < ask)
+                    double px = 0.0;
+                    std::string px_str;
+                    if (same_side_bbo(false, bid, ask, px_tick, px_decimals, px_str, px)
+                        && std::fabs(px - order_px) > px_tick * 0.5)
                     {
-                        const float px = round_to_tick(ask, px_tick);
-                        if (px > bid)
+                        try
                         {
-                            float qty = q_ord / px;
-                            qty = std::floor(qty * 1000.f + 1e-6f) / 1000.f;
-                            if (qty >= 0.001f)
-                            {
-                                try
-                                {
-                                    progressiv_->interface_->ws_cancel_order(o.order_id, trade);
-                                    order_request req;
-                                    req.symbol = trade;
-                                    req.side = "SELL";
-                                    req.type = "LIMIT";
-                                    req.time_in_force = "GTX";
-                                    req.price = format_decimal(px, px_decimals);
-                                    req.quantity = format_decimal(qty, 3);
-                                    progressiv_->interface_->ws_place_order(req);
-                                }
-                                catch (const std::exception& ex)
-                                {
-                                    std::cerr << "reprice SELL rejected: " << ex.what() << '\n';
-                                }
-                            }
+                            order_request req;
+                            req.symbol = trade;
+                            req.side = "SELL";
+                            req.price = px_str;
+                            req.quantity = o.orig_qty.empty() ? format_decimal(std::floor((q_ord / px) * 1000.0 + 1e-6) / 1000.0, 3) : o.orig_qty;
+                            progressiv_->interface_->ws_modify_order(o.order_id, req);
+                        }
+                        catch (const std::exception& ex)
+                        {
+                            std::cerr << "reprice SELL " << px_str
+                                      << " bid=" << format_on_tick(bid, px_tick, px_decimals, false)
+                                      << " ask=" << format_on_tick(ask, px_tick, px_decimals, true)
+                                      << " rejected: " << ex.what() << '\n';
                         }
                     }
                 }
@@ -1098,8 +1137,8 @@ void orderbook_script::run()
                 const float dir = amt > 0.f ? 1.f : -1.f;
                 const char* close_side = dir > 0.f ? "SELL" : "BUY";
                 const float now_sec = static_cast<float>(now_ms) / 1000.f;
-                const float px_tick = trade_tick_size_ > 0.f ? trade_tick_size_ : tick_size;
-                const int px_decimals = decimals_from_tick(px_tick);
+                const double px_tick = trade_tick_size_ > 0.f ? trade_tick_size_ : tick_size;
+                const int px_decimals = trade_price_decimals_;
                 float qty = std::fabs(amt);
                 qty = std::floor(qty * 1000.f + 1e-6f) / 1000.f;
 
@@ -1129,18 +1168,18 @@ void orderbook_script::run()
 
                 auto place_reduce_post_only = [&](const char* side, float raw_px) -> bool
                 {
-                    if (!book_ok || !(bid < ask) || raw_px <= 0.f || qty < 0.001f)
+                    if (!book_ok || qty < 0.001f || raw_px <= 0.f || !(bid < ask))
                         return false;
-                    if (side[0] == 'B' && !(raw_px < ask))
+                    const bool is_buy = side[0] == 'B';
+                    const long long n = tick_index(raw_px, px_tick, !is_buy);
+                    const double px = static_cast<double>(n) * px_tick;
+                    if (n <= 0)
                         return false;
-                    if (side[0] == 'S' && !(raw_px > bid))
+                    if (is_buy && !(px < ask))
                         return false;
-
-                    const float px = round_to_tick(raw_px, px_tick);
-                    if (side[0] == 'B' && !(px < ask))
+                    if (!is_buy && !(px > bid))
                         return false;
-                    if (side[0] == 'S' && !(px > bid))
-                        return false;
+                    const std::string px_str = format_tick_n(n, px_tick, px_decimals);
 
                     order_request req;
                     req.symbol = trade;
@@ -1148,7 +1187,7 @@ void orderbook_script::run()
                     req.type = "LIMIT";
                     req.time_in_force = "GTX";
                     req.reduce_only = true;
-                    req.price = format_decimal(px, px_decimals);
+                    req.price = px_str;
                     req.quantity = format_decimal(qty, 3);
                     try
                     {
@@ -1157,7 +1196,10 @@ void orderbook_script::run()
                     }
                     catch (const std::exception& ex)
                     {
-                        std::cerr << "reduce-only " << side << " rejected: " << ex.what() << '\n';
+                        std::cerr << "reduce-only " << side << " " << req.price
+                                  << " bid=" << format_on_tick(bid, px_tick, px_decimals, false)
+                                  << " ask=" << format_on_tick(ask, px_tick, px_decimals, true)
+                                  << " rejected: " << ex.what() << '\n';
                         return false;
                     }
                 };
@@ -1168,25 +1210,115 @@ void orderbook_script::run()
                     catch (...) { return 0.f; }
                 };
 
-                auto keep_or_reprice = [&](float target_px)
+                auto keep_or_reprice = [&](const std::string& price_str, double target_px)
                 {
-                    const order_info* keep = nullptr;
+                    const order_info* working = nullptr;
                     for (const auto& o : orders)
                     {
-                        if (o.side != close_side)
-                            continue;
-                        if (keep == nullptr
-                            && std::fabs(order_px(o) - target_px) <= px_tick * 0.5f)
-                            keep = &o;
+                        if (o.side == close_side)
+                        {
+                            working = &o;
+                            break;
+                        }
                     }
                     for (const auto& o : orders)
                     {
-                        if (keep && o.order_id == keep->order_id)
+                        if (working && o.order_id == working->order_id)
                             continue;
                         cancel_order(o.order_id);
                     }
-                    if (keep == nullptr)
-                        place_reduce_post_only(close_side, target_px);
+                    if (working == nullptr)
+                    {
+                        place_reduce_post_only(close_side, static_cast<float>(target_px));
+                        return;
+                    }
+                    if (std::fabs(order_px(*working) - target_px) <= px_tick * 0.5)
+                        return;
+                    try
+                    {
+                        order_request req;
+                        req.symbol = trade;
+                        req.side = close_side;
+                        req.price = price_str;
+                        req.quantity = format_decimal(qty, 3);
+                        progressiv_->interface_->ws_modify_order(working->order_id, req);
+                    }
+                    catch (const std::exception& ex)
+                    {
+                        std::cerr << "reprice reduce-only rejected: " << ex.what() << '\n';
+                    }
+                };
+
+                auto snap_exit = [&](double raw, std::string& str, double& px)
+                {
+                    const bool is_buy = close_side[0] == 'B';
+                    const long long n = tick_index(raw, px_tick, !is_buy);
+                    px = static_cast<double>(n) * px_tick;
+                    str = format_tick_n(n, px_tick, px_decimals);
+                };
+
+                auto sync_reduce = [&](const order_info* o, double target_px, const std::string& price_str)
+                {
+                    if (o == nullptr)
+                    {
+                        place_reduce_post_only(close_side, static_cast<float>(target_px));
+                        return;
+                    }
+                    if (std::fabs(order_px(*o) - target_px) <= px_tick * 0.5)
+                        return;
+                    try
+                    {
+                        order_request req;
+                        req.symbol = trade;
+                        req.side = close_side;
+                        req.price = price_str;
+                        req.quantity = format_decimal(qty, 3);
+                        progressiv_->interface_->ws_modify_order(o->order_id, req);
+                    }
+                    catch (const std::exception& ex)
+                    {
+                        std::cerr << "reprice reduce-only rejected: " << ex.what() << '\n';
+                    }
+                };
+
+                auto ensure_tp_sl = [&](double tp_snap, const std::string& tp_str,
+                                        double sl_snap, const std::string& sl_str)
+                {
+                    const order_info* tp_ord = nullptr;
+                    const order_info* sl_ord = nullptr;
+                    for (const auto& o : orders)
+                    {
+                        if (o.side != close_side)
+                        {
+                            cancel_order(o.order_id);
+                            continue;
+                        }
+                        const float p = order_px(o);
+                        const double d_tp = std::fabs(p - tp_snap);
+                        const double d_sl = std::fabs(p - sl_snap);
+                        if (d_tp <= px_tick * 0.5)
+                        {
+                            if (tp_ord == nullptr)
+                                tp_ord = &o;
+                            else
+                                cancel_order(o.order_id);
+                        }
+                        else if (d_sl <= px_tick * 0.5)
+                        {
+                            if (sl_ord == nullptr)
+                                sl_ord = &o;
+                            else
+                                cancel_order(o.order_id);
+                        }
+                        else if (tp_ord == nullptr && d_tp <= d_sl)
+                            tp_ord = &o;
+                        else if (sl_ord == nullptr)
+                            sl_ord = &o;
+                        else
+                            cancel_order(o.order_id);
+                    }
+                    sync_reduce(tp_ord, tp_snap, tp_str);
+                    sync_reduce(sl_ord, sl_snap, sl_str);
                 };
 
                 const bool new_fill = (position_.time <= 0.f || position_.direction != dir);
@@ -1228,17 +1360,36 @@ void orderbook_script::run()
                     ;
                 else if (position_.close_flag)
                 {
-                    // 平多挂卖一、平空挂买一；价格变了立刻挪到新的一档
-                    const float chase_px = round_to_tick(dir > 0.f ? ask : bid, px_tick);
-                    keep_or_reprice(chase_px);
+                    // 平多挂卖一、平空挂买一；价格变了立刻改到新的同向一档
+                    std::string chase_str;
+                    double chase_px = 0.0;
+                    if (same_side_bbo(dir < 0.f, bid, ask, px_tick, px_decimals, chase_str, chase_px))
+                        keep_or_reprice(chase_str, chase_px);
                 }
                 else if (position_.sl_hit)
                 {
-                    keep_or_reprice(round_to_tick(sl_px, px_tick));
+                    // 止损价若无法 GTX 挂上，贴同向一档退出；能挂则只留止损单
+                    std::string sl_str;
+                    double sl_snap = 0.0;
+                    snap_exit(sl_px, sl_str, sl_snap);
+                    const bool sl_maker = (close_side[0] == 'B') ? (sl_snap < ask) : (sl_snap > bid);
+                    if (sl_maker)
+                        keep_or_reprice(sl_str, sl_snap);
+                    else
+                    {
+                        std::string chase_str;
+                        double chase_px = 0.0;
+                        if (same_side_bbo(dir < 0.f, bid, ask, px_tick, px_decimals, chase_str, chase_px))
+                            keep_or_reprice(chase_str, chase_px);
+                    }
                 }
                 else
                 {
-                    keep_or_reprice(round_to_tick(tp_px, px_tick));
+                    std::string tp_str, sl_str;
+                    double tp_snap = 0.0, sl_snap = 0.0;
+                    snap_exit(tp_px, tp_str, tp_snap);
+                    snap_exit(sl_px, sl_str, sl_snap);
+                    ensure_tp_sl(tp_snap, tp_str, sl_snap, sl_str);
                 }
             }
         }
