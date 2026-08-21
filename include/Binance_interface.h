@@ -74,6 +74,7 @@ struct order_request
     std::string quantity;
     std::string quote_order_qty;
     std::string client_order_id;
+    bool reduce_only = false; // 合约只减仓
 };
 
 struct order_info
@@ -152,7 +153,7 @@ public:
     // 查询交易对 tickSize（PRICE_FILTER）；symbol 为空时读 instId.cfg
     float get_tick_size(std::string symbol = {});
 
-    // 经订单线程长连接
+    // 经 USD-M 合约 WS API（ws-fapi）：下单 / 改单 / 查单 / 撤单 / 持仓
     order_info ws_place_order(const order_request& req);
     order_info ws_modify_order(long long order_id, const order_request& req);
     order_info ws_modify_order(const std::string& client_order_id, const order_request& req);
@@ -192,7 +193,7 @@ private:
 
     std::unique_ptr<RpcChannel> balance_channel_;
     std::unique_ptr<RpcChannel> order_channel_;
-    std::unique_ptr<RpcChannel> futures_channel_; // ws-fapi：openOrders / position
+    std::unique_ptr<RpcChannel> futures_channel_; // ws-fapi：下单 / 挂单 / 持仓
     std::unique_ptr<MarketChannel> market_channel_;
     std::unique_ptr<MarketChannel> trade_market_channel_;
     std::unique_ptr<FundingChannel> funding_channel_;

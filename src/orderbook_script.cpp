@@ -149,6 +149,8 @@ void orderbook_script::init(std::string instId)
     ofi_l1 = 0.f;
     predicted_movement = 0.f;
     alpha = 0.f;
+    position_ = {};
+    tau = 0.407647f;
 
     tick_size = progressiv_ -> interface_ ->get_tick_size(instId);
     trade_tick_size_ = progressiv_->interface_->get_tick_size(progressiv_->interface_->trade_symbol());
@@ -309,11 +311,13 @@ void orderbook_script::load_model_params()
             else if (key == "obi") t_coef_.obi = v;
             else if (key == "ml_ofi_5s" || key == "ofi_5s") t_coef_.ml_ofi_5s = v;
             else if (key == "ml_ofi_15s") t_coef_.ml_ofi_15s = v;
+            else if (key == "tau") tau = v;
         });
         std::cout << "loaded T_Param intercept=" << t_coef_.intercept
                   << " obi=" << t_coef_.obi
                   << " ml_ofi_5s=" << t_coef_.ml_ofi_5s
-                  << " ml_ofi_15s=" << t_coef_.ml_ofi_15s << '\n';
+                  << " ml_ofi_15s=" << t_coef_.ml_ofi_15s
+                  << " tau=" << tau << '\n';
     }
 
     const std::string a_text = load_first({
@@ -884,8 +888,33 @@ void orderbook_script::run()
         std::vector<order_info> orders = progressiv_->interface_->ws_open_orders(trade);
         std::vector<position_info> positions = progressiv_ -> interface_ -> ws_get_positions(trade);
 
-        if (orders.empty() && positions.empty())
+        auto has_open_pos = [&]() -> bool
         {
+            for (const auto& p : positions)
+            {
+                if (std::fabs(p.position_amt) > 1e-12f)
+                    return true;
+            }
+            return false;
+        };
+
+        // 仓位刚平时：撤掉剩余 TP/SL/追价单，本 tick 不再开新仓
+        if (position_.time > 0.f && !has_open_pos())
+        {
+            try
+            {
+                if (!orders.empty())
+                    progressiv_->interface_->ws_cancel_all_open_orders(trade);
+            }
+            catch (const std::exception& ex)
+            {
+                std::cerr << "cancel-all after flatten rejected: " << ex.what() << '\n';
+            }
+            position_ = {};
+        }
+        else if (orders.empty() && positions.empty())
+        {
+            position_ = {};
             const auto trade_book = progressiv_->interface_->get_ws_trade_orderbook();
             if (trade_book.bids.empty() || trade_book.asks.empty())
                 ;
@@ -936,6 +965,7 @@ void orderbook_script::run()
         }
         else if (positions.empty() && !orders.empty())
         {
+            position_ = {};
             const auto& o = orders[0];
             // 未成交挂单用 side（BUY/SELL）；单向持仓下 positionSide 常为 BOTH
             const bool is_buy = (o.side == "BUY" || o.position_side == "LONG");
@@ -1048,12 +1078,228 @@ void orderbook_script::run()
         }
         else if (!positions.empty())
         {
-            
+            const position_info& pos = positions.front();
+            const float amt = pos.position_amt;
+            if (std::fabs(amt) < 1e-12f)
+            {
+                try
+                {
+                    if (!orders.empty())
+                        progressiv_->interface_->ws_cancel_all_open_orders(trade);
+                }
+                catch (const std::exception& ex)
+                {
+                    std::cerr << "cancel-all on zero position rejected: " << ex.what() << '\n';
+                }
+                position_ = {};
+            }
+            else
+            {
+                const float dir = amt > 0.f ? 1.f : -1.f;
+                const char* close_side = dir > 0.f ? "SELL" : "BUY";
+                const float now_sec = static_cast<float>(now_ms) / 1000.f;
+                const float px_tick = trade_tick_size_ > 0.f ? trade_tick_size_ : tick_size;
+                const int px_decimals = decimals_from_tick(px_tick);
+                float qty = std::fabs(amt);
+                qty = std::floor(qty * 1000.f + 1e-6f) / 1000.f;
+
+                auto trade_book = progressiv_->interface_->get_ws_trade_orderbook();
+                const bool book_ok = !trade_book.bids.empty() && !trade_book.asks.empty();
+                const float bid = book_ok ? trade_book.bids.front().price : 0.f;
+                const float ask = book_ok ? trade_book.asks.front().price : 0.f;
+
+                auto cancel_order = [&](long long order_id)
+                {
+                    try
+                    {
+                        progressiv_->interface_->ws_cancel_order(order_id, trade);
+                    }
+                    catch (const std::exception& ex)
+                    {
+                        std::cerr << "cancel reduce-only rejected: " << ex.what() << '\n';
+                    }
+                };
+
+                auto cancel_all = [&]()
+                {
+                    for (const auto& o : orders)
+                        cancel_order(o.order_id);
+                    orders.clear();
+                };
+
+                auto place_reduce_post_only = [&](const char* side, float raw_px) -> bool
+                {
+                    if (!book_ok || !(bid < ask) || raw_px <= 0.f || qty < 0.001f)
+                        return false;
+                    if (side[0] == 'B' && !(raw_px < ask))
+                        return false;
+                    if (side[0] == 'S' && !(raw_px > bid))
+                        return false;
+
+                    const float px = round_to_tick(raw_px, px_tick);
+                    if (side[0] == 'B' && !(px < ask))
+                        return false;
+                    if (side[0] == 'S' && !(px > bid))
+                        return false;
+
+                    order_request req;
+                    req.symbol = trade;
+                    req.side = side;
+                    req.type = "LIMIT";
+                    req.time_in_force = "GTX";
+                    req.reduce_only = true;
+                    req.price = format_decimal(px, px_decimals);
+                    req.quantity = format_decimal(qty, 3);
+                    try
+                    {
+                        progressiv_->interface_->ws_place_order(req);
+                        return true;
+                    }
+                    catch (const std::exception& ex)
+                    {
+                        std::cerr << "reduce-only " << side << " rejected: " << ex.what() << '\n';
+                        return false;
+                    }
+                };
+
+                auto order_px = [](const order_info& o) -> float
+                {
+                    try { return std::stof(o.price); }
+                    catch (...) { return 0.f; }
+                };
+
+                auto keep_or_reprice = [&](float target_px)
+                {
+                    const order_info* keep = nullptr;
+                    for (const auto& o : orders)
+                    {
+                        if (o.side != close_side)
+                            continue;
+                        if (keep == nullptr
+                            && std::fabs(order_px(o) - target_px) <= px_tick * 0.5f)
+                            keep = &o;
+                    }
+                    for (const auto& o : orders)
+                    {
+                        if (keep && o.order_id == keep->order_id)
+                            continue;
+                        cancel_order(o.order_id);
+                    }
+                    if (keep == nullptr)
+                        place_reduce_post_only(close_side, target_px);
+                };
+
+                const bool new_fill = (position_.time <= 0.f || position_.direction != dir);
+                if (new_fill)
+                {
+                    position_.time = now_sec;
+                    position_.direction = dir;
+                    position_.close_flag = false;
+                    position_.sl_hit = false;
+                    position_.tp_offset = enable_dynamic_risk_management ? alpha : tp_offset;
+                    cancel_all();
+                }
+
+                const float tp_px = pos.entry_price + dir * position_.tp_offset;
+                const float sl_px = pos.entry_price - dir * position_.tp_offset;
+
+                if (!position_.close_flag && !position_.sl_hit)
+                {
+                    // 与 trainer 一致：TP > SL > horizon > flip
+                    if (book_ok)
+                    {
+                        const bool hit_tp = dir > 0.f ? (bid >= tp_px) : (ask <= tp_px);
+                        const bool hit_sl = dir > 0.f ? (ask <= sl_px) : (bid >= sl_px);
+                        if (!hit_tp && hit_sl)
+                            position_.sl_hit = true;
+                    }
+                    if (!position_.sl_hit)
+                    {
+                        if (now_sec - position_.time >= horizon)
+                            position_.close_flag = true;
+                        if (predicted_movement * position_.direction < 0.f)
+                            position_.close_flag = true;
+                    }
+                    if (position_.close_flag)
+                        cancel_all();
+                }
+
+                if (!book_ok || qty < 0.001f)
+                    ;
+                else if (position_.close_flag)
+                {
+                    // 平多挂卖一、平空挂买一；价格变了立刻挪到新的一档
+                    const float chase_px = round_to_tick(dir > 0.f ? ask : bid, px_tick);
+                    keep_or_reprice(chase_px);
+                }
+                else if (position_.sl_hit)
+                {
+                    keep_or_reprice(round_to_tick(sl_px, px_tick));
+                }
+                else
+                {
+                    keep_or_reprice(round_to_tick(tp_px, px_tick));
+                }
+            }
         }
 
     }
 
     //todo: else :close all orders and positions
+    else
+    {
+        std::vector<order_info> orders = progressiv_->interface_->ws_open_orders(trade);
+        std::vector<position_info> positions = progressiv_ -> interface_ -> ws_get_positions(trade);
+        if (!orders.empty())
+        {
+            try
+            {
+                progressiv_->interface_->ws_cancel_all_open_orders(trade);
+            }
+            catch (const std::exception& ex)
+            {
+                std::cerr << "cancel-all on disable rejected: " << ex.what() << '\n';
+            }
+        }
+        if (!positions.empty())
+        {
+            for (const auto& pos : positions)
+            {
+                const float amt = pos.position_amt;
+                if (std::fabs(amt) < 1e-12f)
+                    continue;
+
+                float qty = std::fabs(amt);
+                qty = std::floor(qty * 1000.f + 1e-6f) / 1000.f;
+                if (qty < 0.001f)
+                    continue;
+
+                order_request req;
+                req.symbol = trade;
+                req.side = amt > 0.f ? "SELL" : "BUY";
+                req.type = "MARKET";
+                req.reduce_only = true;
+                req.quantity = format_decimal(qty, 3);
+                try
+                {
+                    progressiv_->interface_->ws_place_order(req);
+                }
+                catch (const std::exception& ex)
+                {
+                    std::cerr << "market flatten rejected: " << ex.what() << '\n';
+                }
+            }
+            try
+            {
+                progressiv_->interface_->ws_cancel_all_open_orders(trade);
+            }
+            catch (const std::exception& ex)
+            {
+                std::cerr << "cancel-all after flatten rejected: " << ex.what() << '\n';
+            }
+            position_ = {};
+        }
+    }
 
 
     //------------------------------------------------------------------------------------------------------------------

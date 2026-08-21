@@ -94,6 +94,15 @@ struct alpha_coef
     float clip_max = 1.e9f;
 };
 
+struct position_manager
+{
+    bool close_flag = false;   // horizon / flip：追反方向一档平仓
+    bool sl_hit = false;       // 触及对称止损，挂在 sl 价
+    float time = 0.f;          // 建仓时刻（秒）
+    float direction = 0.f;     // +1 多，-1 空
+    float tp_offset = 0.f;     // 开仓时锁定的止盈/止损距离
+};
+
 class orderbook_script : public script
 {
 public:
@@ -110,8 +119,10 @@ private:
     static constexpr float kMidEps = 1e-8f;  // 判定 mid 未变的阈值
     const float horizon = 13;
     const bool enable_dynamic_risk_management = true;
-    float q_ord = 2000;// in usdc
-    const float tau = 0.407647;//found in training result
+    const float tp_offset = 0.08f; // 静态止盈距离，与 trainer.TP_OFFSET 一致
+    float q_ord = 500;// in usdc
+    float tau = 0.407647f; // 从 T_Param.tau 加载，缺省回退
+    position_manager position_;
 
     float tick_size = 0.f;
     float trade_tick_size_ = 0.f;

@@ -824,6 +824,55 @@ finally:
     result_file.close()
 
 
+def minmax_norm(vals):
+    arr = np.asarray(vals, dtype=float)
+    lo = float(np.nanmin(arr))
+    hi = float(np.nanmax(arr))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi - lo < 1e-12:
+        return np.zeros(len(arr), dtype=float)
+    return (arr - lo) / (hi - lo)
+
+
+def select_tau(rows, min_test_n=30):
+    eligible = [s for s in rows if s["test_n"] >= min_test_n]
+    if not eligible:
+        eligible = [s for s in rows if s["test_n"] > 0]
+    if not eligible:
+        return None
+    pnls = np.array([s["test_pnl"] for s in eligible], dtype=float)
+    wrs = np.array([s["test_wins"] / s["test_n"] for s in eligible], dtype=float)
+    tprs = np.array([s["test_exits"]["tp"] / s["test_n"] for s in eligible], dtype=float)
+    sp, sw, st = minmax_norm(pnls), minmax_norm(wrs), minmax_norm(tprs)
+    scores = sp + sw + st
+    i = int(np.argmax(scores))
+    best = eligible[i]
+    return {
+        "tau": float(best["tau"]),
+        "test_n": int(best["test_n"]),
+        "pnl_te": float(best["test_pnl"]),
+        "wr_te": float(best["test_wins"] / best["test_n"]),
+        "tpr_te": float(best["test_exits"]["tp"] / best["test_n"]),
+        "score": float(scores[i]),
+        "score_pnl": float(sp[i]),
+        "score_wr": float(sw[i]),
+        "score_tpr": float(st[i]),
+    }
+
+
+# 实盘 enable_dynamic_risk_management=true，用 dynamic 表选 tau
+tau_choice = select_tau(mode_results["dynamic"])
+if tau_choice is None:
+    tau_choice = select_tau(mode_results["static"])
+if tau_choice is None:
+    raise RuntimeError("no tau candidate with test trades")
+
+print(
+    "selected tau={tau:.6g}  (dynamic, minmax pnl+wr+tpr)  "
+    "n_te={test_n} pnl_te={pnl_te:.6g} wr_te={wr_te:.4f} tpr_te={tpr_te:.4f} "
+    "score={score:.4f} (pnl={score_pnl:.3f} wr={score_wr:.3f} tpr={score_tpr:.3f})".format(**tau_choice)
+)
+
+
 def fmt_param(value):
     if isinstance(value, (float, np.floating)):
         return f"{float(value):.16g}"
@@ -841,7 +890,17 @@ models_dir.mkdir(parents=True, exist_ok=True)
 t_path = models_dir / "T_Param"
 alpha_path = models_dir / "alpha_Param"
 
-write_param_file(t_path, [("intercept", intercept), *weights.items()])
+write_param_file(t_path, [
+    ("intercept", intercept),
+    *weights.items(),
+    ("tau", tau_choice["tau"]),
+    ("tau_mode", "dynamic"),
+    ("tau_n_te", tau_choice["test_n"]),
+    ("tau_pnl_te", tau_choice["pnl_te"]),
+    ("tau_wr_te", tau_choice["wr_te"]),
+    ("tau_tpr_te", tau_choice["tpr_te"]),
+    ("tau_score", tau_choice["score"]),
+])
 
 alpha_m = best_alpha_model
 alpha_items = [

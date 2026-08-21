@@ -349,7 +349,8 @@ namespace
 
     bool is_json_bool_param(const std::string& key)
     {
-        return key == "omitZeroBalances";
+        return key == "omitZeroBalances"
+            || key == "reduceOnly";
     }
 
     void fill_trade_params(std::map<std::string, std::string>& params, const order_request& req)
@@ -368,6 +369,8 @@ namespace
             params["quoteOrderQty"] = req.quote_order_qty;
         if (!req.client_order_id.empty())
             params["newClientOrderId"] = req.client_order_id;
+        if (req.reduce_only)
+            params["reduceOnly"] = "true";
     }
 
     std::vector<orderbook_level> parse_price_levels(const std::string& json, const std::string& key)
@@ -1430,8 +1433,8 @@ order_info binance_interface::ws_place_order(const order_request& req)
 {
     if (api_key_.empty() || private_key_pem_.empty())
         throw std::runtime_error("Binance API credentials are not set");
-    if (!order_channel_)
-        throw std::runtime_error("order channel not started; call start() first");
+    if (!futures_channel_)
+        throw std::runtime_error("futures channel not started; call start() first");
     if (req.side.empty() || req.type.empty())
         throw std::runtime_error("order side/type are required");
 
@@ -1439,51 +1442,46 @@ order_info binance_interface::ws_place_order(const order_request& req)
     params["symbol"] = resolve_symbol(req.symbol);
     fill_trade_params(params, req);
 
-    const std::string response = signed_ws_call(*order_channel_, "order.place", std::move(params));
+    const std::string response = signed_ws_call(*futures_channel_, "order.place", std::move(params));
     ensure_ws_ok(response, "order.place");
     return parse_order(response);
 }
 
 order_info binance_interface::ws_modify_order(long long order_id, const order_request& req)
 {
-    param_map cancel_ids;
-    cancel_ids["cancelOrderId"] = std::to_string(order_id);
-    return modify_order_ws(std::move(cancel_ids), req);
+    param_map ids;
+    ids["orderId"] = std::to_string(order_id);
+    return modify_order_ws(std::move(ids), req);
 }
 
 order_info binance_interface::ws_modify_order(const std::string& client_order_id, const order_request& req)
 {
     if (client_order_id.empty())
         throw std::runtime_error("client_order_id is required");
-    param_map cancel_ids;
-    cancel_ids["cancelOrigClientOrderId"] = client_order_id;
-    return modify_order_ws(std::move(cancel_ids), req);
+    param_map ids;
+    ids["origClientOrderId"] = client_order_id;
+    return modify_order_ws(std::move(ids), req);
 }
 
 order_info binance_interface::modify_order_ws(param_map cancel_id_params, order_request req)
 {
     if (api_key_.empty() || private_key_pem_.empty())
         throw std::runtime_error("Binance API credentials are not set");
-    if (!order_channel_)
-        throw std::runtime_error("order channel not started; call start() first");
-    if (req.side.empty() || req.type.empty())
-        throw std::runtime_error("order side/type are required");
+    if (!futures_channel_)
+        throw std::runtime_error("futures channel not started; call start() first");
+    if (req.side.empty())
+        throw std::runtime_error("order side is required");
 
     param_map params = std::move(cancel_id_params);
     params["symbol"] = resolve_symbol(std::move(req.symbol));
-    params["cancelReplaceMode"] = "STOP_ON_FAILURE";
-    fill_trade_params(params, req);
+    params["side"] = req.side;
+    if (!req.quantity.empty())
+        params["quantity"] = req.quantity;
+    if (!req.price.empty())
+        params["price"] = req.price;
 
-    const std::string response = signed_ws_call(*order_channel_, "order.cancelReplace", std::move(params));
-    ensure_ws_ok(response, "order.cancelReplace");
-
-    const auto nested = response.find("\"newOrderResponse\"");
-    if (nested != std::string::npos)
-    {
-        const auto brace = response.find('{', nested);
-        if (brace != std::string::npos)
-            return parse_order_fields(response.substr(brace));
-    }
+    const std::string response = signed_ws_call(*futures_channel_, "order.modify", std::move(params));
+    ensure_ws_ok(response, "order.modify");
     return parse_order(response);
 }
 
@@ -1491,14 +1489,14 @@ order_info binance_interface::ws_get_order(long long order_id, std::string symbo
 {
     if (api_key_.empty() || private_key_pem_.empty())
         throw std::runtime_error("Binance API credentials are not set");
-    if (!order_channel_)
-        throw std::runtime_error("order channel not started; call start() first");
+    if (!futures_channel_)
+        throw std::runtime_error("futures channel not started; call start() first");
 
     param_map params;
     params["symbol"] = resolve_symbol(std::move(symbol));
     params["orderId"] = std::to_string(order_id);
 
-    const std::string response = signed_ws_call(*order_channel_, "order.status", std::move(params));
+    const std::string response = signed_ws_call(*futures_channel_, "order.status", std::move(params));
     ensure_ws_ok(response, "order.status");
     return parse_order(response);
 }
@@ -1507,8 +1505,8 @@ order_info binance_interface::ws_get_order(const std::string& client_order_id, s
 {
     if (api_key_.empty() || private_key_pem_.empty())
         throw std::runtime_error("Binance API credentials are not set");
-    if (!order_channel_)
-        throw std::runtime_error("order channel not started; call start() first");
+    if (!futures_channel_)
+        throw std::runtime_error("futures channel not started; call start() first");
     if (client_order_id.empty())
         throw std::runtime_error("client_order_id is required");
 
@@ -1516,7 +1514,7 @@ order_info binance_interface::ws_get_order(const std::string& client_order_id, s
     params["symbol"] = resolve_symbol(std::move(symbol));
     params["origClientOrderId"] = client_order_id;
 
-    const std::string response = signed_ws_call(*order_channel_, "order.status", std::move(params));
+    const std::string response = signed_ws_call(*futures_channel_, "order.status", std::move(params));
     ensure_ws_ok(response, "order.status");
     return parse_order(response);
 }
