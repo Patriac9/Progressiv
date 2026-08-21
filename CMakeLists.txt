@@ -9,7 +9,8 @@ add_executable(Progressiv main.cpp
         src/Binance_interface.cpp
         src/ed25519.cpp
         src/orderbook_script.cpp
-        src/script.cpp)
+        src/script.cpp
+        src/async_log.cpp)
 
 target_include_directories(Progressiv PUBLIC ${CMAKE_SOURCE_DIR}/include)
 

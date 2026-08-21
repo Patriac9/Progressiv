@@ -4,6 +4,7 @@
 #include <windows.h>
 #endif
 #include "Progressiv.h"
+#include "async_log.h"
 
 namespace
 {
@@ -27,12 +28,11 @@ int main()
     try
     {
         Progressiv app;
-        std::cerr << "Progressiv starting...\n";
+        async_log::instance().start();
+        async_log::instance().info("Progressiv starting...");
         app.init();
-        std::cerr << "Progressiv init OK, entering loop\n";
         app.run();
         app.destroy();
-        std::cerr << "Progressiv stopped\n";
         return 0;
     }
     catch (const std::exception& e)

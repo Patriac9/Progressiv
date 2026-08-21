@@ -2,10 +2,11 @@
 // Created by zagym on 09/08/2026.
 //
 #include "orderbook_script.h"
+#include "async_log.h"
 #include "loader.h"
-#include <iostream>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <iomanip>
@@ -173,181 +174,36 @@ void orderbook_script::init(std::string instId)
 {
     script::init(instId);
     has_prev_ = false;
-    model_ready_ = false;
-    q_count_ = {};
-    r2_count_ = {};
-    absorb_dm_sum_ = {};
-    row_total_ = {};
-    g1_ = {};
-    adjustment_ = {};
+    prev_bid_quantity = 0.f;
+    prev_ask_quantity = 0.f;
+    prev_asks.clear();
+    prev_bids.clear();
     ml_ofi.clear();
     ml_ofi_time_ms_.clear();
     ml_ofi_start_ms_ = 0;
-    ml_ofi_1s = ml_ofi_5s = ml_ofi_15s = ml_ofi_30s = ml_ofi_60s = 0.f;
-    z_ofi_time_ms_.clear();
-    z_ofi_start_ms_ = 0;
-    z_hist_1s_.clear();
-    z_hist_5s_.clear();
-    z_hist_15s_.clear();
-    z_hist_30s_.clear();
-    z_hist_60s_.clear();
-    z_ml_ofi_1s = z_ml_ofi_5s = z_ml_ofi_15s = z_ml_ofi_30s = z_ml_ofi_60s = 0.f;
-    aggressor_buy_1s = aggressor_sell_1s = aggressor_net_1s = aggressor_imb_1s = aggressor_imb_5s = 0.f;
-    spread_ticks = bid_gap_ticks = ask_gap_ticks = gap_imb = 0.f;
-    bid_slope = ask_slope = slope_imb = 0.f;
-    impact_start_ms_ = 0;
-    impact_time_ms_.clear();
-    impact_ofi_x_.clear();
-    impact_dmid_.clear();
+    ml_ofi_5s = ml_ofi_15s = 0.f;
     mid_hist_time_ms_.clear();
     mid_hist_.clear();
     mid_hist_start_ms_ = 0;
     n_mid_moves_30s = n_mid_moves_60s = rv_30s = rv_60s = 0.f;
-    impact_ofi_1s = impact_ofi_5s = impact_ofi_15s = impact_ofi_30s = impact_ofi_60s = 0.f;
-    impact_trade_1s = impact_trade_5s = impact_trade_15s = impact_trade_30s = impact_trade_60s = 0.f;
-    ofi_l1 = 0.f;
+    obi = 0.f;
+    mid_price = 0.f;
     predicted_movement = 0.f;
     alpha = 0.f;
     position_ = {};
     tau = 0.407647f;
+    output_ = {};
+    {
+        std::lock_guard<std::mutex> lock(signal_mu_);
+        published_ = {};
+    }
+    signal_seq_.store(0);
 
-    tick_size = progressiv_ -> interface_ ->get_tick_size(instId);
+    tick_size = progressiv_->interface_->get_tick_size(instId);
     const auto tf = progressiv_->interface_->get_tick_filter(progressiv_->interface_->trade_symbol());
     trade_tick_size_ = static_cast<float>(tf.tick_size);
     trade_price_decimals_ = tf.decimals;
     load_model_params();
-}
-
-int orderbook_script::imb_bin(float imbalance)
-{
-    const float x = std::clamp(imbalance, 0.f, 1.f - 1e-6f);
-    return static_cast<int>(x * kImbBins);
-}
-
-void orderbook_script::compute_book_shape()
-{
-    spread_ticks = bid_gap_ticks = ask_gap_ticks = gap_imb = 0.f;
-    bid_slope = ask_slope = slope_imb = 0.f;
-    if (bids.empty() || asks.empty() || tick_size <= 0.f)
-        return;
-
-    spread_ticks = (asks[0].price - bids[0].price) / tick_size;
-
-    auto gap_ticks = [&](const std::vector<orderbook_level>& levels, bool is_bid) -> float
-    {
-        float gap = 0.f;
-        for (size_t i = 0; i + 1 < levels.size(); ++i)
-        {
-            const float dp = is_bid
-                ? (levels[i].price - levels[i + 1].price)
-                : (levels[i + 1].price - levels[i].price);
-            const float ticks = dp / tick_size;
-            if (ticks > 1.f)
-                gap += ticks - 1.f;
-        }
-        return gap;
-    };
-
-    // 累计深度对距 mid 的 tick 距离做 OLS，斜率大 = 该侧更厚（Næs-Skjeltorp 的离散近似）
-    auto depth_slope = [&](const std::vector<orderbook_level>& levels, bool is_bid) -> float
-    {
-        double sx = 0.0;
-        double sy = 0.0;
-        double sxx = 0.0;
-        double sxy = 0.0;
-        int n = 0;
-        float cum = 0.f;
-        for (const auto& lv : levels)
-        {
-            cum += lv.quantity;
-            const float dist = is_bid ? (mid_price - lv.price) : (lv.price - mid_price);
-            const float x = dist / tick_size;
-            if (x < 0.f)
-                continue;
-            sx += x;
-            sy += static_cast<double>(cum);
-            sxx += static_cast<double>(x) * x;
-            sxy += static_cast<double>(x) * cum;
-            ++n;
-        }
-        if (n < 2)
-            return 0.f;
-        const double denom = static_cast<double>(n) * sxx - sx * sx;
-        if (std::fabs(denom) < 1e-12)
-            return 0.f;
-        return static_cast<float>((static_cast<double>(n) * sxy - sx * sy) / denom);
-    };
-
-    bid_gap_ticks = gap_ticks(bids, true);
-    ask_gap_ticks = gap_ticks(asks, false);
-    const float gap_sum = bid_gap_ticks + ask_gap_ticks;
-    gap_imb = gap_sum > 1e-12f
-        ? (ask_gap_ticks - bid_gap_ticks) / (gap_sum + 1.f)
-        : 0.f;
-
-    bid_slope = depth_slope(bids, true);
-    ask_slope = depth_slope(asks, false);
-    const float slope_abs = std::fabs(bid_slope) + std::fabs(ask_slope);
-    slope_imb = slope_abs > 1e-12f
-        ? (bid_slope - ask_slope) / (slope_abs + 1e-6f)
-        : 0.f;
-}
-
-void orderbook_script::observe_transition(int from, int to, float d_mid)
-{
-    if (from < 0 || from >= kImbBins || to < 0 || to >= kImbBins)
-        return;
-
-    row_total_[from] += 1.0;
-    if (std::fabs(d_mid) < kMidEps)
-    {
-        // transient: mid 不变，仅 imbalance 转移
-        q_count_[from][to] += 1.0;
-    }
-    else
-    {
-        // absorbing: mid 发生变化
-        absorb_dm_sum_[from] += static_cast<double>(d_mid);
-        r2_count_[from][to] += 1.0;
-    }
-}
-
-bool orderbook_script::solve_linear(std::array<std::array<double, kImbBins>, kImbBins> a,
-                                    std::array<double, kImbBins> b,
-                                    std::array<double, kImbBins>& x)
-{
-    // 高斯消元求解 (I-Q) x = b
-    for (int col = 0; col < kImbBins; ++col)
-    {
-        int pivot = col;
-        for (int row = col + 1; row < kImbBins; ++row)
-        {
-            if (std::fabs(a[row][col]) > std::fabs(a[pivot][col]))
-                pivot = row;
-        }
-        if (std::fabs(a[pivot][col]) < 1e-12)
-            return false;
-
-        std::swap(a[col], a[pivot]);
-        std::swap(b[col], b[pivot]);
-
-        const double div = a[col][col];
-        for (int j = col; j < kImbBins; ++j)
-            a[col][j] /= div;
-        b[col] /= div;
-
-        for (int row = 0; row < kImbBins; ++row)
-        {
-            if (row == col)
-                continue;
-            const double factor = a[row][col];
-            for (int j = col; j < kImbBins; ++j)
-                a[row][j] -= factor * a[col][j];
-            b[row] -= factor * b[col];
-        }
-    }
-    x = b;
-    return true;
 }
 
 void orderbook_script::load_model_params()
@@ -362,7 +218,9 @@ void orderbook_script::load_model_params()
         "../model/param.mod",
     });
     if (p_text.empty())
-        std::cerr << "param.mod not found; using built-in horizon/tp_offset/q_ord\n";
+    {
+        async_log::instance().error("param.mod not found; using built-in horizon/tp_offset/q_ord");
+    }
     else
     {
         for_each_kv(p_text, [&](const std::string& key, const std::string& value)
@@ -376,11 +234,13 @@ void orderbook_script::load_model_params()
             else if (key == "enable_dynamic_risk_management")
                 enable_dynamic_risk_management = parse_bool(value, enable_dynamic_risk_management);
         });
-        std::cout << "loaded param.mod horizon=" << horizon
-                  << " tp_offset=" << tp_offset
-                  << " q_ord=" << q_ord
-                  << " enable_dynamic_risk_management="
-                  << (enable_dynamic_risk_management ? "true" : "false") << '\n';
+        std::ostringstream oss;
+        oss << "loaded param.mod horizon=" << horizon
+            << " tp_offset=" << tp_offset
+            << " q_ord=" << q_ord
+            << " enable_dynamic_risk_management="
+            << (enable_dynamic_risk_management ? "true" : "false");
+        async_log::instance().info(oss.str());
     }
 
     const std::string t_text = load_first({
@@ -390,7 +250,9 @@ void orderbook_script::load_model_params()
         "../pytool/models/T_Param",
     });
     if (t_text.empty())
-        std::cerr << "T_Param not found; T() will return 0\n";
+    {
+        async_log::instance().error("T_Param not found; T() will return 0");
+    }
     else
     {
         for_each_kv(t_text, [&](const std::string& key, const std::string& value)
@@ -402,11 +264,13 @@ void orderbook_script::load_model_params()
             else if (key == "ml_ofi_15s") t_coef_.ml_ofi_15s = v;
             else if (key == "tau") tau = v;
         });
-        std::cout << "loaded T_Param intercept=" << t_coef_.intercept
-                  << " obi=" << t_coef_.obi
-                  << " ml_ofi_5s=" << t_coef_.ml_ofi_5s
-                  << " ml_ofi_15s=" << t_coef_.ml_ofi_15s
-                  << " tau=" << tau << '\n';
+        std::ostringstream oss;
+        oss << "loaded T_Param intercept=" << t_coef_.intercept
+            << " obi=" << t_coef_.obi
+            << " ml_ofi_5s=" << t_coef_.ml_ofi_5s
+            << " ml_ofi_15s=" << t_coef_.ml_ofi_15s
+            << " tau=" << tau;
+        async_log::instance().info(oss.str());
     }
 
     const std::string a_text = load_first({
@@ -416,7 +280,9 @@ void orderbook_script::load_model_params()
         "../pytool/models/alpha_Param",
     });
     if (a_text.empty())
-        std::cerr << "alpha_Param not found; calculate_alpha() will use defaults\n";
+    {
+        async_log::instance().error("alpha_Param not found; calculate_alpha() will use defaults");
+    }
     else
     {
         for_each_kv(a_text, [&](const std::string& key, const std::string& value)
@@ -437,13 +303,15 @@ void orderbook_script::load_model_params()
             else if (key == "clip_min") alpha_coef_.clip_min = v;
             else if (key == "clip_max") alpha_coef_.clip_max = v;
         });
-        std::cout << "loaded alpha_Param kind=" << (alpha_coef_.is_exp ? "exp" : "linear")
-                  << " intercept=" << alpha_coef_.intercept
-                  << " clip=[" << alpha_coef_.clip_min << "," << alpha_coef_.clip_max << "]\n";
+        std::ostringstream oss;
+        oss << "loaded alpha_Param kind=" << (alpha_coef_.is_exp ? "exp" : "linear")
+            << " intercept=" << alpha_coef_.intercept
+            << " clip=[" << alpha_coef_.clip_min << "," << alpha_coef_.clip_max << "]";
+        async_log::instance().info(oss.str());
     }
 }
 
-float orderbook_script::T(const T_parameter& param_)
+float orderbook_script::T(const T_parameter& param_) const
 {
     return t_coef_.intercept
          + t_coef_.obi * param_.obi
@@ -451,7 +319,7 @@ float orderbook_script::T(const T_parameter& param_)
          + t_coef_.ml_ofi_15s * param_.ml_ofi_15s;
 }
 
-float orderbook_script::calculate_alpha(const alpha_parameter& param_)
+float orderbook_script::calculate_alpha(const alpha_parameter& param_) const
 {
     const float z = alpha_coef_.intercept
                   + alpha_coef_.n_mid_moves_30s * param_.n_mid_moves_30s
@@ -471,112 +339,51 @@ float orderbook_script::calculate_alpha(const alpha_parameter& param_)
     return hat;
 }
 
-void orderbook_script::recompute_stoikov_model()
+void orderbook_script::publish_signal(uint64_t tick, long long msg_ms, long long txn_ms)
 {
-    // 构造 Q、R2 概率，以及吸收期望回报向量 r
-    std::array<std::array<double, kImbBins>, kImbBins> Q{};
-    std::array<std::array<double, kImbBins>, kImbBins> R2{};
-    std::array<double, kImbBins> r{};
+    signal_snapshot snap{};
+    snap.tick = tick;
+    snap.message_time_ms = msg_ms;
+    snap.transact_time_ms = txn_ms;
+    snap.T = predicted_movement;
+    snap.alpha = alpha;
+    snap.tau = tau;
+    snap.horizon = horizon;
+    snap.tp_offset = tp_offset;
+    snap.q_ord = q_ord;
+    snap.enable_dynamic_risk_management = enable_dynamic_risk_management;
+    snap.features = output_;
 
-    for (int i = 0; i < kImbBins; ++i)
-    {
-        if (row_total_[i] < 1.0)
-        {
-            Q[i][i] = 1.0; // 无样本时自环，避免奇异
-            continue;
-        }
-        for (int j = 0; j < kImbBins; ++j)
-        {
-            Q[i][j] = q_count_[i][j] / row_total_[i];
-            R2[i][j] = r2_count_[i][j] / row_total_[i];
-        }
-        r[i] = absorb_dm_sum_[i] / row_total_[i];
-    }
+    std::lock_guard<std::mutex> lock(signal_mu_);
+    snap.seq = signal_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+    published_ = snap;
+    signal_cv_.notify_all();
+}
 
-    // G1 = (I - Q)^{-1} r
-    std::array<std::array<double, kImbBins>, kImbBins> I_minus_Q{};
-    for (int i = 0; i < kImbBins; ++i)
-    {
-        for (int j = 0; j < kImbBins; ++j)
-            I_minus_Q[i][j] = (i == j ? 1.0 : 0.0) - Q[i][j];
-    }
+bool orderbook_script::wait_for_signal(uint64_t& last_seq, int timeout_ms)
+{
+    std::unique_lock<std::mutex> lock(signal_mu_);
+    const bool ok = signal_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
+        return signal_seq_.load(std::memory_order_relaxed) != last_seq;
+    });
+    if (!ok && signal_seq_.load(std::memory_order_relaxed) == last_seq)
+        return false;
+    last_seq = signal_seq_.load(std::memory_order_relaxed);
+    return true;
+}
 
-    if (!solve_linear(I_minus_Q, r, g1_))
-    {
-        model_ready_ = false;
-        return;
-    }
-
-    // 对称化：g1(i) = -g1(n-1-i) 的平均（Stoikov 原文 symmetrize）
-    for (int i = 0; i < kImbBins / 2; ++i)
-    {
-        const int j = kImbBins - 1 - i;
-        const double v = 0.5 * (g1_[i] - g1_[j]);
-        g1_[i] = v;
-        g1_[j] = -v;
-    }
-    if (kImbBins % 2 == 1)
-        g1_[kImbBins / 2] = 0.0;
-
-    // B = (I - Q)^{-1} R2，逐列求解
-    std::array<std::array<double, kImbBins>, kImbBins> B{};
-    for (int col = 0; col < kImbBins; ++col)
-    {
-        std::array<double, kImbBins> rhs{};
-        for (int row = 0; row < kImbBins; ++row)
-            rhs[row] = R2[row][col];
-
-        // 每次需要新鲜的 (I-Q)
-        std::array<std::array<double, kImbBins>, kImbBins> A{};
-        for (int i = 0; i < kImbBins; ++i)
-            for (int j = 0; j < kImbBins; ++j)
-                A[i][j] = (i == j ? 1.0 : 0.0) - Q[i][j];
-
-        std::array<double, kImbBins> col_vec{};
-        if (!solve_linear(A, rhs, col_vec))
-        {
-            model_ready_ = false;
-            return;
-        }
-        for (int row = 0; row < kImbBins; ++row)
-            B[row][col] = col_vec[row];
-    }
-
-    // 对称化 B（关于 imbalance 翻转）
-    std::array<std::array<double, kImbBins>, kImbBins> B_sym{};
-    for (int i = 0; i < kImbBins; ++i)
-    {
-        for (int j = 0; j < kImbBins; ++j)
-        {
-            const int ii = kImbBins - 1 - i;
-            const int jj = kImbBins - 1 - j;
-            B_sym[i][j] = 0.5 * (B[i][j] + B[ii][jj]);
-        }
-    }
-    B = B_sym;
-
-    // adjustment = G1 + B G1 + ... + B^{H-1} G1
-    adjustment_ = g1_;
-    std::array<double, kImbBins> term = g1_;
-    for (int h = 1; h < kHorizon; ++h)
-    {
-        std::array<double, kImbBins> next{};
-        for (int i = 0; i < kImbBins; ++i)
-        {
-            double s = 0.0;
-            for (int j = 0; j < kImbBins; ++j)
-                s += B[i][j] * term[j];
-            next[i] = s;
-        }
-        term = next;
-        for (int i = 0; i < kImbBins; ++i)
-            adjustment_[i] += term[i];
-    }
-
-    model_ready_ = true;
+signal_snapshot orderbook_script::latest_signal() const
+{
+    std::lock_guard<std::mutex> lock(signal_mu_);
+    return published_;
 }
 
 void orderbook_script::run()
+{
+    run_signal();
+}
+
+void orderbook_script::run_signal()
 {
     script::run();
     last_tick = current_tick;
@@ -597,7 +404,6 @@ void orderbook_script::run()
     const float quantity_ask = asks[0].quantity;
     const float quantity_bid = bids[0].quantity;
 
-
     float bids_sum = 0.f;
     float asks_sum = 0.f;
     for (const auto& bid : bids)
@@ -609,59 +415,8 @@ void orderbook_script::run()
     if (depth_sum <= 0.f)
         return;
 
-    // 多档定义（与 depth_sum 一致）:
-    // I = ΣQb / (ΣQb + ΣQa) ∈ [0,1)
-    // weighted mid = (Pa·ΣQb + Pb·ΣQa) / (ΣQb + ΣQa)
     obi = (bids_sum - asks_sum) / depth_sum;
-    weighed_obi = obi;
     mid_price = 0.5f * (ask_px + bid_px);
-    weighed_mid_price = (ask_px * bids_sum + bid_px * asks_sum) / depth_sum;
-    compute_book_shape();
-
-    const int bin = imb_bin(obi);
-
-    if (has_prev_)
-    {
-        observe_transition(prev_imb_bin_, bin, mid_price - prev_mid_);
-        double samples = 0.0;
-        for (double v : row_total_)
-            samples += v;
-        if (samples >= static_cast<double>(kImbBins * 20))
-            recompute_stoikov_model();
-    }
-
-    // microprice 随多档 I 变化：
-    // - 模型就绪: M + adjustment[bin(I_multi)]
-    // - 冷启动: 多档加权中间价
-    if (model_ready_)
-        microprice = mid_price + static_cast<float>(adjustment_[bin]);
-    else
-        microprice = weighed_mid_price;
-
-    float buyer_contribution = 0.f;
-    float seller_contribution = 0.f;
-    if (has_prev_ && !prev_bids.empty() && !prev_asks.empty())
-    {
-        const float prev_bid_px = prev_bids[0].price;
-        const float prev_ask_px = prev_asks[0].price;
-
-        // Cont L1 OFI: ΔVb - ΔVa
-        if (bid_px > prev_bid_px)
-            buyer_contribution = quantity_bid;
-        else if (bid_px < prev_bid_px)
-            buyer_contribution = -prev_bid_quantity;
-        else
-            buyer_contribution = quantity_bid - prev_bid_quantity;
-
-        if (ask_px < prev_ask_px)
-            seller_contribution = -quantity_ask;
-        else if (ask_px > prev_ask_px)
-            seller_contribution = prev_ask_quantity;
-        else
-            seller_contribution = -(quantity_ask - prev_ask_quantity);
-    }
-
-    ofi_l1 = buyer_contribution + seller_contribution;
 
     // Multilevel Cont OFI（仅前 10 档），插入 ml_ofi 最前端，并聚合时间窗
     float multilevel_ofi = 0.f;
@@ -701,6 +456,8 @@ void orderbook_script::run()
     const long long now_ms = progressiv_->current_orderbook.message_time != 0
         ? progressiv_->current_orderbook.message_time
         : progressiv_->current_orderbook.transact_time;
+    const long long msg_ms = progressiv_->current_orderbook.message_time;
+    const long long txn_ms = progressiv_->current_orderbook.transact_time;
 
     ml_ofi.insert(ml_ofi.begin(), multilevel_ofi);
     ml_ofi_time_ms_.insert(ml_ofi_time_ms_.begin(), now_ms);
@@ -728,7 +485,7 @@ void orderbook_script::run()
     };
 
     // 归一化: Σ ofi / Σ |ofi| ∈ [-1, 1]
-    // 冷启动：从首次采样起未满窗口时长则输出 0（不依赖裁剪后的 buffer span）
+    // 冷启动：从首次采样起未满窗口时长则输出 0
     auto normalize_ofi_window = [&](long long window_ms) -> float
     {
         if (ml_ofi_start_ms_ == 0 || now_ms - ml_ofi_start_ms_ < window_ms)
@@ -738,89 +495,14 @@ void orderbook_script::run()
         return abs_sum > 1e-12f ? sum / abs_sum : 0.f;
     };
 
-    ml_ofi_1s = normalize_ofi_window(1000);
     ml_ofi_5s = normalize_ofi_window(5000);
     ml_ofi_15s = normalize_ofi_window(15000);
-    ml_ofi_30s = normalize_ofi_window(30000);
-    ml_ofi_60s = normalize_ofi_window(60000);
-
-    // 滚动 1min 历史后计算各窗口因子的 z-score；未满 1min 为 0
-    z_ofi_time_ms_.insert(z_ofi_time_ms_.begin(), now_ms);
-    z_hist_1s_.insert(z_hist_1s_.begin(), ml_ofi_1s);
-    z_hist_5s_.insert(z_hist_5s_.begin(), ml_ofi_5s);
-    z_hist_15s_.insert(z_hist_15s_.begin(), ml_ofi_15s);
-    z_hist_30s_.insert(z_hist_30s_.begin(), ml_ofi_30s);
-    z_hist_60s_.insert(z_hist_60s_.begin(), ml_ofi_60s);
-    if (z_ofi_start_ms_ == 0)
-        z_ofi_start_ms_ = now_ms;
-
-    while (!z_ofi_time_ms_.empty() && now_ms - z_ofi_time_ms_.back() > kZOfiWindowMs)
-    {
-        z_ofi_time_ms_.pop_back();
-        z_hist_1s_.pop_back();
-        z_hist_5s_.pop_back();
-        z_hist_15s_.pop_back();
-        z_hist_30s_.pop_back();
-        z_hist_60s_.pop_back();
-    }
-
-    auto zscore_1min = [&](const std::vector<float>& hist, float x) -> float
-    {
-        if (z_ofi_start_ms_ == 0 || now_ms - z_ofi_start_ms_ < kZOfiWindowMs)
-            return 0.f;
-        if (hist.size() < 2)
-            return 0.f;
-
-        double mean = 0.0;
-        for (float v : hist)
-            mean += static_cast<double>(v);
-        mean /= static_cast<double>(hist.size());
-
-        double var = 0.0;
-        for (float v : hist)
-        {
-            const double d = static_cast<double>(v) - mean;
-            var += d * d;
-        }
-        var /= static_cast<double>(hist.size());
-        const double stddev = std::sqrt(var);
-        if (stddev < 1e-12)
-            return 0.f;
-        return static_cast<float>((static_cast<double>(x) - mean) / stddev);
-    };
-
-    z_ml_ofi_1s = zscore_1min(z_hist_1s_, ml_ofi_1s);
-    z_ml_ofi_5s = zscore_1min(z_hist_5s_, ml_ofi_5s);
-    z_ml_ofi_15s = zscore_1min(z_hist_15s_, ml_ofi_15s);
-    z_ml_ofi_30s = zscore_1min(z_hist_30s_, ml_ofi_30s);
-    z_ml_ofi_60s = zscore_1min(z_hist_60s_, ml_ofi_60s);
-    aggressor_buy_1s = aggressor_sell_1s = aggressor_net_1s = aggressor_imb_1s = aggressor_imb_5s = 0.f;
-    if (progressiv_ && progressiv_->interface_)
-    {
-        try
-        {
-            const auto flow_1s = progressiv_->interface_->get_ws_aggressor_flow(1000);
-            aggressor_buy_1s = flow_1s.buy_qty;
-            aggressor_sell_1s = flow_1s.sell_qty;
-            aggressor_net_1s = flow_1s.net_qty;
-            aggressor_imb_1s = flow_1s.imbalance;
-            aggressor_imb_5s = progressiv_->interface_->get_ws_aggressor_flow(5000).imbalance;
-        }
-        catch (const std::exception&)
-        {
-        }
-    }
-
-    // Cont 冲击系数: Δmid = λ · ofi_l1 + ε，无截距 OLS
-    // Kyle 冲击系数: Δmid_W / aggressor_net_W
-    impact_ofi_1s = impact_ofi_5s = impact_ofi_15s = impact_ofi_30s = impact_ofi_60s = 0.f;
-    impact_trade_1s = impact_trade_5s = impact_trade_15s = impact_trade_30s = impact_trade_60s = 0.f;
 
     mid_hist_time_ms_.insert(mid_hist_time_ms_.begin(), now_ms);
     mid_hist_.insert(mid_hist_.begin(), mid_price);
     if (mid_hist_start_ms_ == 0)
         mid_hist_start_ms_ = now_ms;
-    while (!mid_hist_time_ms_.empty() && now_ms - mid_hist_time_ms_.back() > kImpactMaxMs)
+    while (!mid_hist_time_ms_.empty() && now_ms - mid_hist_time_ms_.back() > kVolMaxMs)
     {
         mid_hist_time_ms_.pop_back();
         mid_hist_.pop_back();
@@ -854,107 +536,11 @@ void orderbook_script::run()
     mid_rv_moves(30000, rv_30s, n_mid_moves_30s);
     mid_rv_moves(60000, rv_60s, n_mid_moves_60s);
 
-    if (has_prev_)
-    {
-        const float d_mid = mid_price - prev_mid_;
-        impact_time_ms_.insert(impact_time_ms_.begin(), now_ms);
-        impact_ofi_x_.insert(impact_ofi_x_.begin(), ofi_l1);
-        impact_dmid_.insert(impact_dmid_.begin(), d_mid);
-        if (impact_start_ms_ == 0)
-            impact_start_ms_ = now_ms;
-
-        while (!impact_time_ms_.empty() && now_ms - impact_time_ms_.back() > kImpactMaxMs)
-        {
-            impact_time_ms_.pop_back();
-            impact_ofi_x_.pop_back();
-            impact_dmid_.pop_back();
-        }
-
-        auto ols_lambda = [&](long long window_ms) -> float
-        {
-            if (impact_start_ms_ == 0 || now_ms - impact_start_ms_ < window_ms)
-                return 0.f;
-
-            double sxx = 0.0;
-            double sxy = 0.0;
-            for (size_t i = 0; i < impact_time_ms_.size(); ++i)
-            {
-                if (now_ms - impact_time_ms_[i] > window_ms)
-                    break;
-                const double x = static_cast<double>(impact_ofi_x_[i]);
-                const double y = static_cast<double>(impact_dmid_[i]);
-                sxx += x * x;
-                sxy += x * y;
-            }
-            if (sxx < 1e-18)
-                return 0.f;
-            return static_cast<float>(sxy / sxx);
-        };
-
-        impact_ofi_1s = ols_lambda(1000);
-        impact_ofi_5s = ols_lambda(5000);
-        impact_ofi_15s = ols_lambda(15000);
-        impact_ofi_30s = ols_lambda(30000);
-        impact_ofi_60s = ols_lambda(60000);
-    }
-
-    auto mid_delta = [&](long long window_ms) -> float
-    {
-        if (mid_hist_.size() < 2)
-            return 0.f;
-
-        float mid_old = mid_hist_.back();
-        bool found = false;
-        for (size_t i = 0; i < mid_hist_time_ms_.size(); ++i)
-        {
-            if (now_ms - mid_hist_time_ms_[i] >= window_ms)
-            {
-                mid_old = mid_hist_[i];
-                found = true;
-                break;
-            }
-        }
-        if (!found)
-            return 0.f;
-        return mid_price - mid_old;
-    };
-
-    auto kyle_lambda = [&](long long window_ms) -> float
-    {
-        if (!progressiv_ || !progressiv_->interface_)
-            return 0.f;
-        const float dmid = mid_delta(window_ms);
-        if (dmid == 0.f && mid_hist_.size() < 2)
-            return 0.f;
-        try
-        {
-            const auto flow = progressiv_->interface_->get_ws_aggressor_flow(window_ms);
-            if (std::fabs(flow.net_qty) < 1e-12f)
-                return 0.f;
-            return dmid / flow.net_qty;
-        }
-        catch (const std::exception&)
-        {
-            return 0.f;
-        }
-    };
-
-    impact_trade_1s = kyle_lambda(1000);
-    impact_trade_5s = kyle_lambda(5000);
-    impact_trade_15s = kyle_lambda(15000);
-    impact_trade_30s = kyle_lambda(30000);
-    impact_trade_60s = kyle_lambda(60000);
-
-    micro_price_offset = (microprice - mid_price) / tick_size;
-
     prev_bid_quantity = quantity_bid;
     prev_ask_quantity = quantity_ask;
-    prev_mid_ = mid_price;
-    prev_imb_bin_ = bin;
     has_prev_ = true;
     prev_asks = asks;
     prev_bids = bids;
-    //------------------------------------------------------------------------------------------------------------------
 
     predicted_movement = T({
         .obi = obi,
@@ -969,10 +555,39 @@ void orderbook_script::run()
         .abs_T = std::fabs(predicted_movement),
     });
 
-    const auto& signal = progressiv_->interface_->signal_symbol();
-    const auto& trade  = progressiv_->interface_->trade_symbol();
+    output_.obi = obi;
+    output_.mid_price = mid_price;
+    output_.ml_ofi_5s = ml_ofi_5s;
+    output_.ml_ofi_15s = ml_ofi_15s;
+    output_.n_mid_moves_30s = n_mid_moves_30s;
+    output_.n_mid_moves_60s = n_mid_moves_60s;
+    output_.rv_30s = rv_30s;
+    output_.rv_60s = rv_60s;
+    output_.T = predicted_movement;
+    output_.alpha = alpha;
 
-    if (progressiv_ -> get_enable_live_action())
+    publish_signal(current_tick, msg_ms, txn_ms);
+}
+
+void orderbook_script::run_execution()
+{
+    if (!progressiv_ || !progressiv_->interface_)
+        return;
+
+    const signal_snapshot snap = latest_signal();
+    if (snap.seq == 0)
+        return;
+    const float predicted_movement = snap.T;
+    const float alpha = snap.alpha;
+    const float tau = snap.tau;
+    const float horizon = snap.horizon;
+    const float q_ord = snap.q_ord;
+    const float tp_offset = snap.tp_offset;
+    const bool enable_dynamic_risk_management = snap.enable_dynamic_risk_management;
+
+    const auto& trade = progressiv_->interface_->trade_symbol();
+
+    if (progressiv_->get_enable_live_action())
     {
         std::vector<order_info> orders;
         std::vector<position_info> positions;
@@ -983,8 +598,7 @@ void orderbook_script::run()
         }
         catch (const std::exception& ex)
         {
-            // 例如 -2015 IP/权限：打日志并跳过本 tick，避免整个进程退出
-            std::cerr << "live query rejected: " << ex.what() << '\n';
+            async_log::instance().error(std::string("live query rejected: ") + ex.what());
             return;
         }
 
@@ -998,19 +612,24 @@ void orderbook_script::run()
             return false;
         };
 
-        // 仓位刚平时：撤掉剩余 TP/SL/追价单，本 tick 不再开新仓
+        // 仓位刚平：需连续多 tick 确认，避免持仓查询短暂空窗清空状态（会重置 horizon/flip）
         if (position_.time > 0.f && !has_open_pos())
         {
-            try
+            ++position_.empty_pos_streak;
+            if (position_.empty_pos_streak >= 5)
             {
-                if (!orders.empty())
-                    progressiv_->interface_->ws_cancel_all_open_orders(trade);
+                try
+                {
+                    if (!orders.empty())
+                        progressiv_->interface_->ws_cancel_all_open_orders(trade);
+                }
+                catch (const std::exception& ex)
+                {
+                    async_log::instance().error(
+                        std::string("cancel-all after flatten rejected: ") + ex.what());
+                }
+                position_ = {};
             }
-            catch (const std::exception& ex)
-            {
-                std::cerr << "cancel-all after flatten rejected: " << ex.what() << '\n';
-            }
-            position_ = {};
         }
         else if (orders.empty() && positions.empty())
         {
@@ -1051,10 +670,12 @@ void orderbook_script::run()
                     }
                     catch (const std::exception& ex)
                     {
-                        std::cerr << "post-only " << side << " " << req.price
-                                  << " bid=" << format_on_tick(bid, px_tick, px_decimals, false)
-                                  << " ask=" << format_on_tick(ask, px_tick, px_decimals, true)
-                                  << " rejected: " << ex.what() << '\n';
+                        std::ostringstream oss;
+                        oss << "post-only " << side << " " << req.price
+                            << " bid=" << format_on_tick(bid, px_tick, px_decimals, false)
+                            << " ask=" << format_on_tick(ask, px_tick, px_decimals, true)
+                            << " rejected: " << ex.what();
+                        async_log::instance().error(oss.str());
                     }
                 };
 
@@ -1066,6 +687,11 @@ void orderbook_script::run()
         }
         else if (positions.empty() && !orders.empty())
         {
+            // 仍在确认是否已平仓时，不要把持仓状态清掉、也不要把 TP 当开仓单追价
+            if (position_.time > 0.f)
+                ;
+            else
+            {
             position_ = {};
             const auto& o = orders[0];
             // 未成交挂单用 side（BUY/SELL）；单向持仓下 positionSide 常为 BOTH
@@ -1088,7 +714,8 @@ void orderbook_script::run()
                     }
                     catch (const std::exception& ex)
                     {
-                        std::cerr << "cancel BUY rejected: " << ex.what() << '\n';
+                        async_log::instance().error(
+                            std::string("cancel BUY rejected: ") + ex.what());
                     }
                 }
                 else if (std::abs(predicted_movement) >= tau)
@@ -1108,15 +735,42 @@ void orderbook_script::run()
                             req.symbol = trade;
                             req.side = "BUY";
                             req.price = px_str;
-                            req.quantity = o.orig_qty.empty() ? format_decimal(std::floor((q_ord / px) * 1000.0 + 1e-6) / 1000.0, 3) : o.orig_qty;
+                            req.quantity = o.orig_qty.empty()
+                                ? format_decimal(std::floor((q_ord / px) * 1000.0 + 1e-6) / 1000.0, 3)
+                                : o.orig_qty;
                             progressiv_->interface_->ws_modify_order(o.order_id, req);
                         }
                         catch (const std::exception& ex)
                         {
-                            std::cerr << "reprice BUY " << px_str
-                                      << " bid=" << format_on_tick(bid, px_tick, px_decimals, false)
-                                      << " ask=" << format_on_tick(ask, px_tick, px_decimals, true)
-                                      << " rejected: " << ex.what() << '\n';
+                            if (binance_interface::is_missing_order_error(ex.what()))
+                            {
+                                progressiv_->interface_->forget_open_order(o.order_id);
+                                order_request req;
+                                req.symbol = trade;
+                                req.side = "BUY";
+                                req.type = "LIMIT";
+                                req.time_in_force = "GTX";
+                                req.price = px_str;
+                                req.quantity = o.orig_qty.empty()
+                                    ? format_decimal(std::floor((q_ord / px) * 1000.0 + 1e-6) / 1000.0, 3)
+                                    : o.orig_qty;
+                                try { progressiv_->interface_->ws_place_order(req); }
+                                catch (const std::exception& ex2)
+                                {
+                                    async_log::instance().error(
+                                        std::string("re-place BUY after missing modify rejected: ")
+                                        + ex2.what());
+                                }
+                            }
+                            else
+                            {
+                                std::ostringstream oss;
+                                oss << "reprice BUY " << px_str
+                                    << " bid=" << format_on_tick(bid, px_tick, px_decimals, false)
+                                    << " ask=" << format_on_tick(ask, px_tick, px_decimals, true)
+                                    << " rejected: " << ex.what();
+                                async_log::instance().error(oss.str());
+                            }
                         }
                     }
                 }
@@ -1131,7 +785,8 @@ void orderbook_script::run()
                     }
                     catch (const std::exception& ex)
                     {
-                        std::cerr << "cancel SELL rejected: " << ex.what() << '\n';
+                        async_log::instance().error(
+                            std::string("cancel SELL rejected: ") + ex.what());
                     }
                 }
                 else if (std::abs(predicted_movement) >= tau)
@@ -1151,22 +806,51 @@ void orderbook_script::run()
                             req.symbol = trade;
                             req.side = "SELL";
                             req.price = px_str;
-                            req.quantity = o.orig_qty.empty() ? format_decimal(std::floor((q_ord / px) * 1000.0 + 1e-6) / 1000.0, 3) : o.orig_qty;
+                            req.quantity = o.orig_qty.empty()
+                                ? format_decimal(std::floor((q_ord / px) * 1000.0 + 1e-6) / 1000.0, 3)
+                                : o.orig_qty;
                             progressiv_->interface_->ws_modify_order(o.order_id, req);
                         }
                         catch (const std::exception& ex)
                         {
-                            std::cerr << "reprice SELL " << px_str
-                                      << " bid=" << format_on_tick(bid, px_tick, px_decimals, false)
-                                      << " ask=" << format_on_tick(ask, px_tick, px_decimals, true)
-                                      << " rejected: " << ex.what() << '\n';
+                            if (binance_interface::is_missing_order_error(ex.what()))
+                            {
+                                progressiv_->interface_->forget_open_order(o.order_id);
+                                order_request req;
+                                req.symbol = trade;
+                                req.side = "SELL";
+                                req.type = "LIMIT";
+                                req.time_in_force = "GTX";
+                                req.price = px_str;
+                                req.quantity = o.orig_qty.empty()
+                                    ? format_decimal(std::floor((q_ord / px) * 1000.0 + 1e-6) / 1000.0, 3)
+                                    : o.orig_qty;
+                                try { progressiv_->interface_->ws_place_order(req); }
+                                catch (const std::exception& ex2)
+                                {
+                                    async_log::instance().error(
+                                        std::string("re-place SELL after missing modify rejected: ")
+                                        + ex2.what());
+                                }
+                            }
+                            else
+                            {
+                                std::ostringstream oss;
+                                oss << "reprice SELL " << px_str
+                                    << " bid=" << format_on_tick(bid, px_tick, px_decimals, false)
+                                    << " ask=" << format_on_tick(ask, px_tick, px_decimals, true)
+                                    << " rejected: " << ex.what();
+                                async_log::instance().error(oss.str());
+                            }
                         }
                     }
                 }
             }
+            } // else: 无持仓状态，管理开仓挂单
         }
         else if (!positions.empty())
         {
+            position_.empty_pos_streak = 0;
             const position_info& pos = positions.front();
             const float amt = pos.position_amt;
             if (std::fabs(amt) < 1e-12f)
@@ -1178,7 +862,8 @@ void orderbook_script::run()
                 }
                 catch (const std::exception& ex)
                 {
-                    std::cerr << "cancel-all on zero position rejected: " << ex.what() << '\n';
+                    async_log::instance().error(
+                        std::string("cancel-all on zero position rejected: ") + ex.what());
                 }
                 position_ = {};
             }
@@ -1186,7 +871,8 @@ void orderbook_script::run()
             {
                 const float dir = amt > 0.f ? 1.f : -1.f;
                 const char* close_side = dir > 0.f ? "SELL" : "BUY";
-                const float now_sec = static_cast<float>(now_ms) / 1000.f;
+                // horizon 用本地墙钟，避免盘口 message_time 停滞导致计时失效
+                const float now_sec = static_cast<float>(binance_interface::now_ms()) / 1000.f;
                 const double px_tick = trade_tick_size_ > 0.f ? trade_tick_size_ : tick_size;
                 const int px_decimals = trade_price_decimals_;
                 float qty = std::fabs(amt);
@@ -1205,7 +891,8 @@ void orderbook_script::run()
                     }
                     catch (const std::exception& ex)
                     {
-                        std::cerr << "cancel reduce-only rejected: " << ex.what() << '\n';
+                        async_log::instance().error(
+                            std::string("cancel reduce-only rejected: ") + ex.what());
                     }
                 };
 
@@ -1214,6 +901,35 @@ void orderbook_script::run()
                     for (const auto& o : orders)
                         cancel_order(o.order_id);
                     orders.clear();
+                };
+
+                auto place_reduce_gtx = [&](const std::string& px_str) -> bool
+                {
+                    if (!book_ok || qty < 0.001f || px_str.empty() || !(bid < ask))
+                        return false;
+                    order_request req;
+                    req.symbol = trade;
+                    req.side = close_side;
+                    req.type = "LIMIT";
+                    req.time_in_force = "GTX";
+                    req.reduce_only = true;
+                    req.price = px_str;
+                    req.quantity = format_decimal(qty, 3);
+                    try
+                    {
+                        progressiv_->interface_->ws_place_order(req);
+                        return true;
+                    }
+                    catch (const std::exception& ex)
+                    {
+                        std::ostringstream oss;
+                        oss << "reduce-only GTX " << close_side << " " << req.price
+                            << " bid=" << format_on_tick(bid, px_tick, px_decimals, false)
+                            << " ask=" << format_on_tick(ask, px_tick, px_decimals, true)
+                            << " rejected: " << ex.what();
+                        async_log::instance().error(oss.str());
+                        return false;
+                    }
                 };
 
                 auto place_reduce_post_only = [&](const char* side, float raw_px) -> bool
@@ -1229,35 +945,37 @@ void orderbook_script::run()
                         return false;
                     if (!is_buy && !(px > bid))
                         return false;
-                    const std::string px_str = format_tick_n(n, px_tick, px_decimals);
-
-                    order_request req;
-                    req.symbol = trade;
-                    req.side = side;
-                    req.type = "LIMIT";
-                    req.time_in_force = "GTX";
-                    req.reduce_only = true;
-                    req.price = px_str;
-                    req.quantity = format_decimal(qty, 3);
-                    try
-                    {
-                        progressiv_->interface_->ws_place_order(req);
-                        return true;
-                    }
-                    catch (const std::exception& ex)
-                    {
-                        std::cerr << "reduce-only " << side << " " << req.price
-                                  << " bid=" << format_on_tick(bid, px_tick, px_decimals, false)
-                                  << " ask=" << format_on_tick(ask, px_tick, px_decimals, true)
-                                  << " rejected: " << ex.what() << '\n';
-                        return false;
-                    }
+                    return place_reduce_gtx(format_tick_n(n, px_tick, px_decimals));
                 };
 
                 auto order_px = [](const order_info& o) -> float
                 {
                     try { return std::stof(o.price); }
                     catch (...) { return 0.f; }
+                };
+
+                // flip/horizon：必须 GTX。改价用撤+重挂，避免 order.modify 丢 GTX/reduceOnly
+                auto chase_gtx_bbo = [&]()
+                {
+                    std::string chase_str;
+                    double chase_px = 0.0;
+                    if (!same_side_bbo(dir < 0.f, bid, ask, px_tick, px_decimals, chase_str, chase_px))
+                        return;
+
+                    const order_info* working = nullptr;
+                    for (const auto& o : orders)
+                    {
+                        if (o.side == close_side
+                            && std::fabs(order_px(o) - chase_px) <= px_tick * 0.5)
+                        {
+                            working = &o;
+                            continue;
+                        }
+                        cancel_order(o.order_id);
+                    }
+                    if (working != nullptr)
+                        return;
+                    place_reduce_gtx(chase_str);
                 };
 
                 auto keep_or_reprice = [&](const std::string& price_str, double target_px)
@@ -1284,19 +1002,9 @@ void orderbook_script::run()
                     }
                     if (std::fabs(order_px(*working) - target_px) <= px_tick * 0.5)
                         return;
-                    try
-                    {
-                        order_request req;
-                        req.symbol = trade;
-                        req.side = close_side;
-                        req.price = price_str;
-                        req.quantity = format_decimal(qty, 3);
-                        progressiv_->interface_->ws_modify_order(working->order_id, req);
-                    }
-                    catch (const std::exception& ex)
-                    {
-                        std::cerr << "reprice reduce-only rejected: " << ex.what() << '\n';
-                    }
+                    // 撤掉旧单再挂 GTX，保证 timeInForce/reduceOnly 不被 modify 丢掉
+                    cancel_order(working->order_id);
+                    place_reduce_gtx(price_str);
                 };
 
                 auto snap_exit = [&](double raw, std::string& str, double& px)
@@ -1307,35 +1015,9 @@ void orderbook_script::run()
                     str = format_tick_n(n, px_tick, px_decimals);
                 };
 
-                auto sync_reduce = [&](const order_info* o, double target_px, const std::string& price_str)
-                {
-                    if (o == nullptr)
-                    {
-                        place_reduce_post_only(close_side, static_cast<float>(target_px));
-                        return;
-                    }
-                    if (std::fabs(order_px(*o) - target_px) <= px_tick * 0.5)
-                        return;
-                    try
-                    {
-                        order_request req;
-                        req.symbol = trade;
-                        req.side = close_side;
-                        req.price = price_str;
-                        req.quantity = format_decimal(qty, 3);
-                        progressiv_->interface_->ws_modify_order(o->order_id, req);
-                    }
-                    catch (const std::exception& ex)
-                    {
-                        std::cerr << "reprice reduce-only rejected: " << ex.what() << '\n';
-                    }
-                };
-
-                auto ensure_tp_sl = [&](double tp_snap, const std::string& tp_str,
-                                        double sl_snap, const std::string& sl_str)
+                auto ensure_tp = [&](double tp_snap, const std::string& tp_str)
                 {
                     const order_info* tp_ord = nullptr;
-                    const order_info* sl_ord = nullptr;
                     for (const auto& o : orders)
                     {
                         if (o.side != close_side)
@@ -1343,32 +1025,42 @@ void orderbook_script::run()
                             cancel_order(o.order_id);
                             continue;
                         }
-                        const float p = order_px(o);
-                        const double d_tp = std::fabs(p - tp_snap);
-                        const double d_sl = std::fabs(p - sl_snap);
-                        if (d_tp <= px_tick * 0.5)
+                        // 暂不挂交易所 SL；清掉遗留 STOP_* 单
+                        const bool is_stop = (o.type == "STOP_MARKET" || o.type == "STOP"
+                            || o.type == "TAKE_PROFIT_MARKET" || o.type == "TAKE_PROFIT");
+                        if (is_stop)
+                        {
+                            cancel_order(o.order_id);
+                            continue;
+                        }
+                        if (o.type == "LIMIT" || o.type.empty())
                         {
                             if (tp_ord == nullptr)
                                 tp_ord = &o;
                             else
                                 cancel_order(o.order_id);
                         }
-                        else if (d_sl <= px_tick * 0.5)
-                        {
-                            if (sl_ord == nullptr)
-                                sl_ord = &o;
-                            else
-                                cancel_order(o.order_id);
-                        }
-                        else if (tp_ord == nullptr && d_tp <= d_sl)
-                            tp_ord = &o;
-                        else if (sl_ord == nullptr)
-                            sl_ord = &o;
                         else
+                        {
                             cancel_order(o.order_id);
+                        }
                     }
-                    sync_reduce(tp_ord, tp_snap, tp_str);
-                    sync_reduce(sl_ord, sl_snap, sl_str);
+
+                    const bool tp_maker = (close_side[0] == 'B') ? (tp_snap < ask) : (tp_snap > bid);
+                    if (!tp_maker)
+                    {
+                        if (tp_ord)
+                            cancel_order(tp_ord->order_id);
+                    }
+                    else if (tp_ord == nullptr)
+                    {
+                        place_reduce_post_only(close_side, static_cast<float>(tp_snap));
+                    }
+                    else if (std::fabs(order_px(*tp_ord) - tp_snap) > px_tick * 0.5)
+                    {
+                        cancel_order(tp_ord->order_id);
+                        place_reduce_gtx(tp_str);
+                    }
                 };
 
                 const bool new_fill = (position_.time <= 0.f || position_.direction != dir);
@@ -1398,9 +1090,21 @@ void orderbook_script::run()
                     if (!position_.sl_hit)
                     {
                         if (now_sec - position_.time >= horizon)
+                        {
                             position_.close_flag = true;
-                        if (predicted_movement * position_.direction < 0.f)
+                            std::ostringstream oss;
+                            oss << "exit trigger: horizon age=" << (now_sec - position_.time)
+                                << "s dir=" << dir;
+                            async_log::instance().info(oss.str());
+                        }
+                        else if (predicted_movement * position_.direction < 0.f)
+                        {
                             position_.close_flag = true;
+                            std::ostringstream oss;
+                            oss << "exit trigger: flip T=" << predicted_movement
+                                << " dir=" << dir;
+                            async_log::instance().info(oss.str());
+                        }
                     }
                     if (position_.close_flag)
                         cancel_all();
@@ -1410,11 +1114,8 @@ void orderbook_script::run()
                     ;
                 else if (position_.close_flag)
                 {
-                    // 平多挂卖一、平空挂买一；价格变了立刻改到新的同向一档
-                    std::string chase_str;
-                    double chase_px = 0.0;
-                    if (same_side_bbo(dir < 0.f, bid, ask, px_tick, px_decimals, chase_str, chase_px))
-                        keep_or_reprice(chase_str, chase_px);
+                    // flip/horizon：GTX 贴同向一档（平多卖一 / 平空买一）
+                    chase_gtx_bbo();
                 }
                 else if (position_.sl_hit)
                 {
@@ -1426,31 +1127,22 @@ void orderbook_script::run()
                     if (sl_maker)
                         keep_or_reprice(sl_str, sl_snap);
                     else
-                    {
-                        std::string chase_str;
-                        double chase_px = 0.0;
-                        if (same_side_bbo(dir < 0.f, bid, ask, px_tick, px_decimals, chase_str, chase_px))
-                            keep_or_reprice(chase_str, chase_px);
-                    }
+                        chase_gtx_bbo();
                 }
                 else
                 {
-                    std::string tp_str, sl_str;
-                    double tp_snap = 0.0, sl_snap = 0.0;
+                    std::string tp_str;
+                    double tp_snap = 0.0;
                     snap_exit(tp_px, tp_str, tp_snap);
-                    snap_exit(sl_px, sl_str, sl_snap);
-                    ensure_tp_sl(tp_snap, tp_str, sl_snap, sl_str);
+                    ensure_tp(tp_snap, tp_str);
                 }
             }
         }
-
     }
-
-    //todo: else :close all orders and positions
     else
     {
         std::vector<order_info> orders = progressiv_->interface_->ws_open_orders(trade);
-        std::vector<position_info> positions = progressiv_ -> interface_ -> ws_get_positions(trade);
+        std::vector<position_info> positions = progressiv_->interface_->ws_get_positions(trade);
         if (!orders.empty())
         {
             try
@@ -1459,7 +1151,8 @@ void orderbook_script::run()
             }
             catch (const std::exception& ex)
             {
-                std::cerr << "cancel-all on disable rejected: " << ex.what() << '\n';
+                async_log::instance().error(
+                    std::string("cancel-all on disable rejected: ") + ex.what());
             }
         }
         if (!positions.empty())
@@ -1487,7 +1180,8 @@ void orderbook_script::run()
                 }
                 catch (const std::exception& ex)
                 {
-                    std::cerr << "market flatten rejected: " << ex.what() << '\n';
+                    async_log::instance().error(
+                        std::string("market flatten rejected: ") + ex.what());
                 }
             }
             try
@@ -1496,46 +1190,12 @@ void orderbook_script::run()
             }
             catch (const std::exception& ex)
             {
-                std::cerr << "cancel-all after flatten rejected: " << ex.what() << '\n';
+                async_log::instance().error(
+                    std::string("cancel-all after flatten rejected: ") + ex.what());
             }
             position_ = {};
         }
     }
-
-
-    //------------------------------------------------------------------------------------------------------------------
-
-
-    output_.obi = obi;
-    output_.mid_price = mid_price;
-    output_.ml_ofi_1s = ml_ofi_1s;
-    output_.ml_ofi_5s = ml_ofi_5s;
-    output_.ml_ofi_15s = ml_ofi_15s;
-    output_.ml_ofi_30s = ml_ofi_30s;
-    output_.ml_ofi_60s = ml_ofi_60s;
-    output_.aggressor_imb_1s = aggressor_imb_1s;
-    output_.aggressor_imb_5s = aggressor_imb_5s;
-    output_.spread_ticks = spread_ticks;
-    output_.bid_gap_ticks = bid_gap_ticks;
-    output_.ask_gap_ticks = ask_gap_ticks;
-    output_.gap_imb = gap_imb;
-    output_.bid_slope = bid_slope;
-    output_.ask_slope = ask_slope;
-    output_.slope_imb = slope_imb;
-    output_.impact_ofi_1s = impact_ofi_1s;
-    output_.impact_ofi_5s = impact_ofi_5s;
-    output_.impact_ofi_15s = impact_ofi_15s;
-    output_.impact_ofi_30s = impact_ofi_30s;
-    output_.impact_ofi_60s = impact_ofi_60s;
-    output_.impact_trade_1s = impact_trade_1s;
-    output_.impact_trade_5s = impact_trade_5s;
-    output_.impact_trade_15s = impact_trade_15s;
-    output_.impact_trade_30s = impact_trade_30s;
-    output_.impact_trade_60s = impact_trade_60s;
-    output_.n_mid_moves_30s = n_mid_moves_30s;
-    output_.n_mid_moves_60s = n_mid_moves_60s;
-    output_.rv_30s = rv_30s;
-    output_.rv_60s = rv_60s;
 }
 
 void orderbook_script::destroy()

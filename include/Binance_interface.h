@@ -72,10 +72,12 @@ struct order_request
     std::string type;
     std::string time_in_force;
     std::string price;
+    std::string stop_price;   // STOP_MARKET / TAKE_PROFIT_MARKET 等
     std::string quantity;
     std::string quote_order_qty;
     std::string client_order_id;
     bool reduce_only = false; // 合约只减仓
+    bool close_position = false; // 触发后平掉该方向全部仓位
 };
 
 struct order_info
@@ -89,6 +91,7 @@ struct order_info
     std::string type;
     std::string time_in_force;
     std::string price;
+    std::string stop_price;
     std::string orig_qty;
     std::string executed_qty;
     std::string cummulative_quote_qty;
@@ -177,6 +180,10 @@ public:
     order_info ws_cancel_order(const std::string& client_order_id, std::string symbol = {});
     // USD-M 合约：取消该交易对全部挂单（openOrders.cancelAll）；symbol 空则用买卖对象
     std::vector<order_info> ws_cancel_all_open_orders(std::string symbol = {});
+    // 从本地挂单缓存移除（订单已成交/不存在时用）
+    void forget_open_order(long long order_id);
+    static bool is_missing_order_error(const std::string& message);
+    static long long now_ms();
 
 private:
     using param_map = std::map<std::string, std::string>;
@@ -234,7 +241,7 @@ private:
     static order_info parse_user_stream_order(const std::string& order_obj);
     static std::string extract_result_object(const std::string& json);
     static void ensure_ws_ok(const std::string& json, const char* what);
-    static long long now_ms();
+
     static bool is_terminal_order_status(const std::string& status);
 
     mutable std::mutex open_orders_mutex_;

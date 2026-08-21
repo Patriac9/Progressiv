@@ -353,7 +353,8 @@ namespace
     bool is_json_bool_param(const std::string& key)
     {
         return key == "omitZeroBalances"
-            || key == "reduceOnly";
+            || key == "reduceOnly"
+            || key == "closePosition";
     }
 
     void fill_trade_params(std::map<std::string, std::string>& params, const order_request& req)
@@ -366,6 +367,8 @@ namespace
             params["timeInForce"] = "GTC";
         if (!req.price.empty())
             params["price"] = req.price;
+        if (!req.stop_price.empty())
+            params["stopPrice"] = req.stop_price;
         if (!req.quantity.empty())
             params["quantity"] = req.quantity;
         if (!req.quote_order_qty.empty())
@@ -374,6 +377,8 @@ namespace
             params["newClientOrderId"] = req.client_order_id;
         if (req.reduce_only)
             params["reduceOnly"] = "true";
+        if (req.close_position)
+            params["closePosition"] = "true";
     }
 
     std::vector<orderbook_level> parse_price_levels(const std::string& json, const std::string& key)
@@ -443,6 +448,9 @@ namespace
         order.type = extract_json_string(obj, "type");
         order.time_in_force = extract_json_string(obj, "timeInForce");
         order.price = extract_json_string(obj, "price");
+        order.stop_price = extract_json_string(obj, "stopPrice");
+        if (order.stop_price.empty())
+            order.stop_price = extract_json_string(obj, "sp");
         order.orig_qty = extract_json_string(obj, "origQty");
         order.executed_qty = extract_json_string(obj, "executedQty");
         order.cummulative_quote_qty = extract_json_string(obj, "cummulativeQuoteQty");
@@ -970,6 +978,8 @@ struct binance_interface::MarketChannel
         const bool ok = cv.wait_for(lock, wait, [this] {
             return !running || (has_data && generation_ > last_consumed_gen_);
         });
+        if (!running)
+            throw std::runtime_error("MarketChannel stopped");
         if (!ok)
             throw std::runtime_error("MarketChannel: wait orderbook timeout");
         if (!has_data)
@@ -1767,6 +1777,12 @@ order_info binance_interface::modify_order_ws(param_map cancel_id_params, order_
     if (req.side.empty())
         throw std::runtime_error("order side is required");
 
+    long long order_id = 0;
+    if (const auto it = cancel_id_params.find("orderId"); it != cancel_id_params.end())
+    {
+        try { order_id = std::stoll(it->second); } catch (...) {}
+    }
+
     param_map params = std::move(cancel_id_params);
     params["symbol"] = resolve_symbol(std::move(req.symbol));
     params["side"] = req.side;
@@ -1775,11 +1791,23 @@ order_info binance_interface::modify_order_ws(param_map cancel_id_params, order_
     if (!req.price.empty())
         params["price"] = req.price;
 
-    const std::string response = signed_ws_call(*futures_channel_, "order.modify", std::move(params));
-    ensure_ws_ok(response, "order.modify");
-    order_info order = parse_order(response);
-    upsert_open_order_cache(order);
-    return order;
+    try
+    {
+        const std::string response = signed_ws_call(*futures_channel_, "order.modify", std::move(params));
+        ensure_ws_ok(response, "order.modify");
+        order_info order = parse_order(response);
+        upsert_open_order_cache(order);
+        return order;
+    }
+    catch (const std::exception& ex)
+    {
+        if (is_missing_order_error(ex.what()))
+        {
+            if (order_id != 0)
+                erase_open_order_cache(order_id);
+        }
+        throw;
+    }
 }
 
 order_info binance_interface::ws_get_order(long long order_id, std::string symbol)
@@ -1873,11 +1901,27 @@ order_info binance_interface::ws_cancel_order(long long order_id, std::string sy
     params["symbol"] = resolve_symbol(std::move(symbol));
     params["orderId"] = std::to_string(order_id);
 
-    const std::string response = signed_ws_call(*futures_channel_, "order.cancel", std::move(params));
-    ensure_ws_ok(response, "order.cancel");
-    order_info order = parse_order(response);
-    erase_open_order_cache(order.order_id);
-    return order;
+    try
+    {
+        const std::string response = signed_ws_call(*futures_channel_, "order.cancel", std::move(params));
+        ensure_ws_ok(response, "order.cancel");
+        order_info order = parse_order(response);
+        erase_open_order_cache(order.order_id != 0 ? order.order_id : order_id);
+        return order;
+    }
+    catch (const std::exception& ex)
+    {
+        // 已成交/已撤：清缓存，视为成功，避免策略反复对僵尸 id 撤单
+        if (is_missing_order_error(ex.what()))
+        {
+            erase_open_order_cache(order_id);
+            order_info gone;
+            gone.order_id = order_id;
+            gone.status = "CANCELED";
+            return gone;
+        }
+        throw;
+    }
 }
 
 order_info binance_interface::ws_cancel_order(const std::string& client_order_id, std::string symbol)
@@ -1893,11 +1937,25 @@ order_info binance_interface::ws_cancel_order(const std::string& client_order_id
     params["symbol"] = resolve_symbol(std::move(symbol));
     params["origClientOrderId"] = client_order_id;
 
-    const std::string response = signed_ws_call(*futures_channel_, "order.cancel", std::move(params));
-    ensure_ws_ok(response, "order.cancel");
-    order_info order = parse_order(response);
-    erase_open_order_cache(order.order_id);
-    return order;
+    try
+    {
+        const std::string response = signed_ws_call(*futures_channel_, "order.cancel", std::move(params));
+        ensure_ws_ok(response, "order.cancel");
+        order_info order = parse_order(response);
+        erase_open_order_cache(order.order_id);
+        return order;
+    }
+    catch (const std::exception& ex)
+    {
+        if (is_missing_order_error(ex.what()))
+        {
+            order_info gone;
+            gone.client_order_id = client_order_id;
+            gone.status = "CANCELED";
+            return gone;
+        }
+        throw;
+    }
 }
 
 std::vector<order_info> binance_interface::ws_cancel_all_open_orders(std::string symbol)
@@ -1937,6 +1995,19 @@ bool binance_interface::is_terminal_order_status(const std::string& status)
         || status == "CANCELLED"
         || status == "EXPIRED"
         || status == "REJECTED";
+}
+
+bool binance_interface::is_missing_order_error(const std::string& message)
+{
+    return message.find("\"code\":-2013") != std::string::npos
+        || message.find("\"code\":-2011") != std::string::npos
+        || message.find("Order does not exist") != std::string::npos
+        || message.find("Unknown order sent") != std::string::npos;
+}
+
+void binance_interface::forget_open_order(long long order_id)
+{
+    erase_open_order_cache(order_id);
 }
 
 void binance_interface::invalidate_positions_cache()
@@ -2156,6 +2227,7 @@ order_info binance_interface::parse_user_stream_order(const std::string& order_o
     order.type = extract_json_string(order_obj, "o");
     order.time_in_force = extract_json_string(order_obj, "f");
     order.price = extract_json_string(order_obj, "p");
+    order.stop_price = extract_json_string(order_obj, "sp");
     order.orig_qty = extract_json_string(order_obj, "q");
     order.executed_qty = extract_json_string(order_obj, "z");
     order.cummulative_quote_qty = extract_json_string(order_obj, "Z");

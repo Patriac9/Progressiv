@@ -9,10 +9,11 @@
 #include <ctime>
 #include <filesystem>
 #include <iomanip>
-#include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include "Binance_interface.h"
+#include "async_log.h"
 #include "loader.h"
 #include "script.h"
 #include "orderbook_script.h"
@@ -89,8 +90,9 @@ namespace
     {
         if (symbol.empty() || day.empty() || day == "-")
             return;
-        std::filesystem::create_directories("training_data/" + symbol);
-        loader::write_file("training_data/" + symbol + "/" + day + ".jsonl", line, write_mode::append);
+        const std::string dir = "training_data/" + symbol;
+        std::filesystem::create_directories(dir);
+        async_log::instance().write_file(dir + "/" + day + ".jsonl", line);
     }
 }
 
@@ -102,13 +104,21 @@ Progressiv::Progressiv()
 
 void Progressiv::destroy()
 {
+    running_ = false;
     if (interface_)
         interface_->stop();
+    if (signal_thread_.joinable())
+        signal_thread_.join();
+    if (exec_thread_.joinable())
+        exec_thread_.join();
+    async_log::instance().stop();
 }
 
 Progressiv::~Progressiv()
 {
     destroy();
+    delete script;
+    script = nullptr;
     delete interface_;
     interface_ = nullptr;
 }
@@ -134,49 +144,104 @@ void Progressiv::load_app_cfg(const std::string& content)
 
 void Progressiv::init()
 {
+    async_log::instance().start();
     load_app_cfg(loader::load_file("app.cfg"));
-    if (use_testnet) interface_ -> init("demo_credential.cfg");
+    if (use_testnet) interface_->init("demo_credential.cfg");
     else interface_->init("credential.cfg");
-    interface_->start(30); // 行情/余额/订单 三路长连接
-    script -> set_controller(this);
-    script -> init(interface_->signal_symbol());
+    interface_->start(30);
+    script->set_controller(this);
+    script->init(interface_->signal_symbol());
     if (interface_->split_trade_market())
         trade_tick_size_ = interface_->get_tick_size(interface_->trade_symbol());
     else
         trade_tick_size_ = 0.f;
+    async_log::instance().info("Progressiv init OK");
 }
 
-
-void Progressiv::run()
+void Progressiv::signal_loop()
 {
-    try
+    while (running_)
     {
-        while (true)
+        try
         {
-            // 只读行情线程缓存，不再每次握手
+            const auto wait_t0 = std::chrono::steady_clock::now();
             current_orderbook = interface_->get_ws_orderbook();
+            const auto wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - wait_t0).count();
+            if (!running_)
+                break;
+
+            const auto compute_t0 = std::chrono::steady_clock::now();
             transaction_time = format_ms_timestamp(current_orderbook.transact_time);
             message_time = format_ms_timestamp(current_orderbook.message_time);
             current_tick = current_orderbook.last_update_id;
             asks = current_orderbook.asks;
             bids = current_orderbook.bids;
-            script ->set_asks(asks);
-            script ->set_bids(bids);
-            script -> run();
-            if (!enable_training_capture)
-                continue;
+            script->set_asks(asks);
+            script->set_bids(bids);
+            script->run_signal();
+            const auto compute_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - compute_t0).count();
 
-            const std::string day = (message_time.size() >= 8) ? message_time.substr(0, 8) : std::string{};
-            capture_signal_sample(day);
-            if (interface_->split_trade_market())
-                capture_trade_sample(day, message_time);
+            const long long exch_t = current_orderbook.transact_time;
+            const long long recv_t = current_orderbook.message_time;
+            const long long exch_lag_ms = (exch_t > 0 && recv_t > 0) ? (recv_t - exch_t) : -1;
+            async_log::instance().set_loop_metrics(
+                exch_lag_ms,
+                static_cast<double>(wait_us) / 1000.0,
+                static_cast<double>(compute_us) / 1000.0);
+
+            if (enable_training_capture)
+            {
+                const std::string day = (message_time.size() >= 8) ? message_time.substr(0, 8) : std::string{};
+                capture_signal_sample(day);
+                if (interface_->split_trade_market())
+                    capture_trade_sample(day, message_time);
+            }
+        }
+        catch (const std::exception& e)
+        {
+            if (!running_)
+                break;
+            async_log::instance().error(std::string("signal loop: ") + e.what());
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
-    catch (std::exception& e)
+}
+
+void Progressiv::execution_loop()
+{
+    uint64_t last_seq = 0;
+    while (running_)
     {
-        std::cerr << "run loop stopped: " << e.what() << std::endl;
-        throw;
+        try
+        {
+            if (!script->wait_for_signal(last_seq, 200))
+                continue;
+            script->run_execution();
+        }
+        catch (const std::exception& e)
+        {
+            async_log::instance().error(std::string("exec loop: ") + e.what());
+            if (!running_)
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
     }
+}
+
+void Progressiv::run()
+{
+    running_ = true;
+    async_log::instance().info("entering signal+exec threads");
+    signal_thread_ = std::thread([this] { signal_loop(); });
+    exec_thread_ = std::thread([this] { execution_loop(); });
+    if (signal_thread_.joinable())
+        signal_thread_.join();
+    running_ = false;
+    if (exec_thread_.joinable())
+        exec_thread_.join();
+    async_log::instance().stop();
 }
 
 void Progressiv::capture_signal_sample(const std::string& day)
@@ -191,17 +256,12 @@ void Progressiv::capture_signal_sample(const std::string& day)
          << ",\"mid_price\":" << o.mid_price
          << ",\"ml_ofi_5s\":" << o.ml_ofi_5s
          << ",\"ml_ofi_15s\":" << o.ml_ofi_15s
-         << ",\"ml_ofi_30s\":" << o.ml_ofi_30s
-         << ",\"ml_ofi_60s\":" << o.ml_ofi_60s
-         << ",\"aggressor_imb_5s\":" << o.aggressor_imb_5s
-         << ",\"gap_imb\":" << o.gap_imb
-         << ",\"bid_slope\":" << o.bid_slope
-         << ",\"ask_slope\":" << o.ask_slope
-         << ",\"slope_imb\":" << o.slope_imb
          << ",\"n_mid_moves_30s\":" << o.n_mid_moves_30s
          << ",\"n_mid_moves_60s\":" << o.n_mid_moves_60s
          << ",\"rv_30s\":" << o.rv_30s
          << ",\"rv_60s\":" << o.rv_60s
+         << ",\"T\":" << o.T
+         << ",\"alpha\":" << o.alpha
          << "}\n";
     append_jsonl(interface_->signal_symbol(), day, line.str());
 }
@@ -214,7 +274,7 @@ void Progressiv::capture_trade_sample(const std::string& day, const std::string&
     }
     catch (const std::exception& e)
     {
-        std::cerr << "trade orderbook not ready: " << e.what() << std::endl;
+        async_log::instance().error(std::string("trade orderbook not ready: ") + e.what());
         return;
     }
 
