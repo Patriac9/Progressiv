@@ -174,7 +174,8 @@ void Progressiv::run()
     }
     catch (std::exception& e)
     {
-        std::cerr << e.what() << std::endl;
+        std::cerr << "run loop stopped: " << e.what() << std::endl;
+        throw;
     }
 }
 

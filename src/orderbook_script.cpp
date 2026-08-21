@@ -974,8 +974,19 @@ void orderbook_script::run()
 
     if (progressiv_ -> get_enable_live_action())
     {
-        std::vector<order_info> orders = progressiv_->interface_->ws_open_orders(trade);
-        std::vector<position_info> positions = progressiv_ -> interface_ -> ws_get_positions(trade);
+        std::vector<order_info> orders;
+        std::vector<position_info> positions;
+        try
+        {
+            orders = progressiv_->interface_->ws_open_orders(trade);
+            positions = progressiv_->interface_->ws_get_positions(trade);
+        }
+        catch (const std::exception& ex)
+        {
+            // 例如 -2015 IP/权限：打日志并跳过本 tick，避免整个进程退出
+            std::cerr << "live query rejected: " << ex.what() << '\n';
+            return;
+        }
 
         auto has_open_pos = [&]() -> bool
         {

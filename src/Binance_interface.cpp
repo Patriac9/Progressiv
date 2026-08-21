@@ -589,6 +589,47 @@ namespace
         return result.body;
     }
 
+    HttpsResult https_api_key(
+        const std::string& host,
+        const std::wstring& method,
+        const std::string& path,
+        const std::string& api_key)
+    {
+        const std::wstring headers = L"X-MBX-APIKEY: " + utf8_to_wide(api_key) + L"\r\n";
+        return https_call(host, method, path, headers);
+    }
+
+    std::string extract_json_object(const std::string& json, const std::string& key)
+    {
+        const std::string pattern = "\"" + key + "\":";
+        size_t pos = 0;
+        while ((pos = json.find(pattern, pos)) != std::string::npos)
+        {
+            size_t i = pos + pattern.size();
+            while (i < json.size() && (json[i] == ' ' || json[i] == '\t' || json[i] == '\n' || json[i] == '\r'))
+                ++i;
+            if (i < json.size() && json[i] == '{')
+            {
+                int depth = 0;
+                const size_t begin = i;
+                for (; i < json.size(); ++i)
+                {
+                    if (json[i] == '{')
+                        ++depth;
+                    else if (json[i] == '}')
+                    {
+                        --depth;
+                        if (depth == 0)
+                            return json.substr(begin, i - begin + 1);
+                    }
+                }
+                return {};
+            }
+            pos += pattern.size();
+        }
+        return {};
+    }
+
     int tick_string_decimals(const std::string& s)
     {
         const auto dot = s.find('.');
@@ -1013,6 +1054,171 @@ struct binance_interface::MarketChannel
     }
 };
 
+struct binance_interface::UserDataChannel
+{
+    binance_interface* owner = nullptr;
+    std::string stream_host;
+    std::string rest_host;
+    std::string api_key;
+    std::atomic<bool> running{false};
+    std::thread worker;
+    std::mutex key_mutex;
+    std::string listen_key;
+
+    void start(binance_interface* o, std::string stream_h, std::string rest_h, std::string key)
+    {
+        owner = o;
+        stream_host = std::move(stream_h);
+        rest_host = std::move(rest_h);
+        api_key = std::move(key);
+        if (running.exchange(true))
+            return;
+        worker = std::thread([this] { run(); });
+    }
+
+    void stop()
+    {
+        if (!running.exchange(false))
+            return;
+        if (worker.joinable())
+            worker.join();
+        close_listen_key();
+    }
+
+    std::string create_listen_key()
+    {
+        const auto result = https_api_key(rest_host, L"POST", "/fapi/v1/listenKey", api_key);
+        if (result.status != 200)
+            throw std::runtime_error("listenKey create failed: " + result.body);
+        const std::string key = extract_json_string(result.body, "listenKey");
+        if (key.empty())
+            throw std::runtime_error("listenKey missing in response: " + result.body);
+        return key;
+    }
+
+    void keepalive_listen_key(const std::string& key)
+    {
+        const auto result = https_api_key(rest_host, L"PUT", "/fapi/v1/listenKey", api_key);
+        if (result.status != 200)
+            throw std::runtime_error("listenKey keepalive failed: " + result.body);
+        (void)key;
+    }
+
+    void close_listen_key()
+    {
+        try
+        {
+            https_api_key(rest_host, L"DELETE", "/fapi/v1/listenKey", api_key);
+        }
+        catch (...)
+        {
+        }
+        std::lock_guard lock(key_mutex);
+        listen_key.clear();
+    }
+
+    void handle_message(const std::string& msg)
+    {
+        if (!owner)
+            return;
+        const std::string event = extract_json_string(msg, "e");
+        if (event == "ORDER_TRADE_UPDATE")
+        {
+            const std::string order_obj = extract_json_object(msg, "o");
+            if (order_obj.empty())
+                return;
+            owner->upsert_open_order_cache(binance_interface::parse_user_stream_order(order_obj));
+            owner->invalidate_positions_cache();
+        }
+        else if (event == "ACCOUNT_UPDATE")
+        {
+            owner->invalidate_positions_cache();
+        }
+        else if (event == "listenKeyExpired")
+        {
+            std::cerr << "UserDataChannel listenKeyExpired; will recreate\n";
+            std::lock_guard lock(key_mutex);
+            listen_key.clear();
+        }
+    }
+
+    void run_session(const std::string& path, const std::string& key, long long& last_keepalive_ms)
+    {
+        WsHandles ws = ws_connect(stream_host, path);
+        last_keepalive_ms = binance_interface::now_ms();
+        std::cerr << "UserDataChannel connected: " << path << '\n';
+
+        while (running)
+        {
+            const long long now = binance_interface::now_ms();
+            if (now - last_keepalive_ms >= 30 * 60 * 1000)
+            {
+                keepalive_listen_key(key);
+                last_keepalive_ms = now;
+            }
+
+            {
+                std::lock_guard lock(key_mutex);
+                if (listen_key.empty())
+                    break;
+            }
+
+            const std::string msg = ws_recv(ws.socket);
+            if (msg.empty())
+                break;
+            handle_message(msg);
+        }
+        ws.close();
+    }
+
+    void run()
+    {
+        long long last_keepalive_ms = 0;
+        while (running)
+        {
+            try
+            {
+                std::string key;
+                {
+                    std::lock_guard lock(key_mutex);
+                    if (listen_key.empty())
+                        listen_key = create_listen_key();
+                    key = listen_key;
+                }
+
+                // 当前环境 WinHTTP 对 /private/ws 升级常失败；优先用稳定的 /ws/{listenKey}
+                try
+                {
+                    run_session("/ws/" + key, key, last_keepalive_ms);
+                }
+                catch (const std::exception& e_legacy)
+                {
+                    std::cerr << "UserDataChannel legacy /ws failed: " << e_legacy.what()
+                              << "; trying /private/ws\n";
+                    const std::string private_path =
+                        "/private/ws?listenKey=" + key
+                        + "&events=ORDER_TRADE_UPDATE,ACCOUNT_UPDATE,listenKeyExpired";
+                    run_session(private_path, key, last_keepalive_ms);
+                }
+            }
+            catch (const std::exception& e)
+            {
+                std::cerr << "UserDataChannel error: " << e.what() << std::endl;
+                if (!running)
+                    break;
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+            }
+            catch (...)
+            {
+                std::cerr << "UserDataChannel unknown error\n";
+                if (!running)
+                    break;
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+            }
+        }
+    }
+};
+
 struct binance_interface::FundingChannel
 {
     std::string host;
@@ -1337,6 +1543,19 @@ void binance_interface::start(uint32_t depth_levels)
         trade_agg_trade_channel_->start(ws_stream_host_, trade_symbol_);
     }
 
+    user_data_channel_ = std::make_unique<UserDataChannel>();
+    user_data_channel_->start(this, ws_stream_host_, rest_host, api_key_);
+    try
+    {
+        refresh_open_order_cache_rest(trade_symbol_);
+        std::cerr << "openOrders bootstrap OK, cached "
+                  << snapshot_open_order_cache(trade_symbol_).size() << " orders\n";
+    }
+    catch (const std::exception& ex)
+    {
+        std::cerr << "openOrders bootstrap skipped: " << ex.what() << '\n';
+    }
+
     started_ = true;
 }
 
@@ -1362,6 +1581,8 @@ void binance_interface::stop()
         order_channel_->stop();
     if (futures_channel_)
         futures_channel_->stop();
+    if (user_data_channel_)
+        user_data_channel_->stop();
 
     market_channel_.reset();
     trade_market_channel_.reset();
@@ -1371,6 +1592,7 @@ void binance_interface::stop()
     balance_channel_.reset();
     order_channel_.reset();
     futures_channel_.reset();
+    user_data_channel_.reset();
 }
 
 std::pair<std::string, std::string> binance_interface::parse_inst_id(const std::string& content)
@@ -1515,7 +1737,9 @@ order_info binance_interface::ws_place_order(const order_request& req)
 
     const std::string response = signed_ws_call(*futures_channel_, "order.place", std::move(params));
     ensure_ws_ok(response, "order.place");
-    return parse_order(response);
+    order_info order = parse_order(response);
+    upsert_open_order_cache(order);
+    return order;
 }
 
 order_info binance_interface::ws_modify_order(long long order_id, const order_request& req)
@@ -1553,7 +1777,9 @@ order_info binance_interface::modify_order_ws(param_map cancel_id_params, order_
 
     const std::string response = signed_ws_call(*futures_channel_, "order.modify", std::move(params));
     ensure_ws_ok(response, "order.modify");
-    return parse_order(response);
+    order_info order = parse_order(response);
+    upsert_open_order_cache(order);
+    return order;
 }
 
 order_info binance_interface::ws_get_order(long long order_id, std::string symbol)
@@ -1595,12 +1821,9 @@ std::vector<order_info> binance_interface::ws_open_orders(std::string symbol)
     if (api_key_.empty() || private_key_pem_.empty())
         throw std::runtime_error("Binance API credentials are not set");
 
-    param_map params;
-    if (!symbol.empty())
-        params["symbol"] = resolve_symbol(std::move(symbol));
-
-    const std::string response = signed_fapi_rest(L"GET", "/fapi/v1/openOrders", std::move(params));
-    return parse_open_orders(response);
+    symbol = symbol.empty() ? std::string{} : resolve_symbol(std::move(symbol));
+    // 热路径只读 User Data Stream / 本地缓存，不再 REST 轮询
+    return snapshot_open_order_cache(symbol);
 }
 
 std::vector<position_info> binance_interface::ws_get_positions(std::string symbol, bool only_open)
@@ -1610,13 +1833,33 @@ std::vector<position_info> binance_interface::ws_get_positions(std::string symbo
     if (!futures_channel_)
         throw std::runtime_error("futures channel not started; call start() first");
 
+    symbol = symbol.empty() ? std::string{} : resolve_symbol(std::move(symbol));
+    {
+        std::lock_guard lock(positions_mutex_);
+        if (positions_cache_ms_ > 0
+            && positions_cache_symbol_ == symbol
+            && positions_cache_only_open_ == only_open
+            && now_ms() - positions_cache_ms_ < kPositionsRefreshMs)
+        {
+            return positions_cache_;
+        }
+    }
+
     param_map params;
     if (!symbol.empty())
-        params["symbol"] = resolve_symbol(std::move(symbol));
+        params["symbol"] = symbol;
 
     const std::string response = signed_ws_call(*futures_channel_, "account.position", std::move(params));
     ensure_ws_ok(response, "account.position");
-    return parse_positions(response, only_open);
+    auto positions = parse_positions(response, only_open);
+    {
+        std::lock_guard lock(positions_mutex_);
+        positions_cache_ = positions;
+        positions_cache_symbol_ = symbol;
+        positions_cache_only_open_ = only_open;
+        positions_cache_ms_ = now_ms();
+    }
+    return positions;
 }
 
 order_info binance_interface::ws_cancel_order(long long order_id, std::string symbol)
@@ -1632,7 +1875,9 @@ order_info binance_interface::ws_cancel_order(long long order_id, std::string sy
 
     const std::string response = signed_ws_call(*futures_channel_, "order.cancel", std::move(params));
     ensure_ws_ok(response, "order.cancel");
-    return parse_order(response);
+    order_info order = parse_order(response);
+    erase_open_order_cache(order.order_id);
+    return order;
 }
 
 order_info binance_interface::ws_cancel_order(const std::string& client_order_id, std::string symbol)
@@ -1650,7 +1895,9 @@ order_info binance_interface::ws_cancel_order(const std::string& client_order_id
 
     const std::string response = signed_ws_call(*futures_channel_, "order.cancel", std::move(params));
     ensure_ws_ok(response, "order.cancel");
-    return parse_order(response);
+    order_info order = parse_order(response);
+    erase_open_order_cache(order.order_id);
+    return order;
 }
 
 std::vector<order_info> binance_interface::ws_cancel_all_open_orders(std::string symbol)
@@ -1658,13 +1905,110 @@ std::vector<order_info> binance_interface::ws_cancel_all_open_orders(std::string
     if (api_key_.empty() || private_key_pem_.empty())
         throw std::runtime_error("Binance API credentials are not set");
 
+    const std::string sym = resolve_symbol(std::move(symbol));
     param_map params;
-    params["symbol"] = resolve_symbol(std::move(symbol));
+    params["symbol"] = sym;
 
     const std::string response = signed_fapi_rest(L"DELETE", "/fapi/v1/allOpenOrders", std::move(params));
+    std::vector<order_info> cancelled;
     if (!response.empty() && response.front() == '[')
-        return parse_open_orders(response);
-    return {};
+        cancelled = parse_open_orders(response);
+
+    {
+        std::lock_guard lock(open_orders_mutex_);
+        if (sym.empty())
+            open_orders_cache_.clear();
+        else
+        {
+            open_orders_cache_.erase(
+                std::remove_if(open_orders_cache_.begin(), open_orders_cache_.end(),
+                               [&](const order_info& o) { return o.symbol == sym; }),
+                open_orders_cache_.end());
+        }
+        open_orders_cache_ms_ = now_ms();
+    }
+    return cancelled;
+}
+
+bool binance_interface::is_terminal_order_status(const std::string& status)
+{
+    return status == "FILLED"
+        || status == "CANCELED"
+        || status == "CANCELLED"
+        || status == "EXPIRED"
+        || status == "REJECTED";
+}
+
+void binance_interface::invalidate_positions_cache()
+{
+    std::lock_guard lock(positions_mutex_);
+    positions_cache_ms_ = 0;
+}
+
+void binance_interface::replace_open_order_cache(std::vector<order_info> orders)
+{
+    std::lock_guard lock(open_orders_mutex_);
+    open_orders_cache_ = std::move(orders);
+    open_orders_cache_ms_ = now_ms();
+}
+
+void binance_interface::upsert_open_order_cache(const order_info& order)
+{
+    if (order.order_id == 0)
+        return;
+    std::lock_guard lock(open_orders_mutex_);
+    if (is_terminal_order_status(order.status))
+    {
+        open_orders_cache_.erase(
+            std::remove_if(open_orders_cache_.begin(), open_orders_cache_.end(),
+                           [&](const order_info& o) { return o.order_id == order.order_id; }),
+            open_orders_cache_.end());
+        return;
+    }
+    for (auto& o : open_orders_cache_)
+    {
+        if (o.order_id == order.order_id)
+        {
+            o = order;
+            return;
+        }
+    }
+    open_orders_cache_.push_back(order);
+}
+
+void binance_interface::erase_open_order_cache(long long order_id)
+{
+    if (order_id == 0)
+        return;
+    std::lock_guard lock(open_orders_mutex_);
+    open_orders_cache_.erase(
+        std::remove_if(open_orders_cache_.begin(), open_orders_cache_.end(),
+                       [&](const order_info& o) { return o.order_id == order_id; }),
+        open_orders_cache_.end());
+}
+
+std::vector<order_info> binance_interface::snapshot_open_order_cache(const std::string& symbol) const
+{
+    std::lock_guard lock(open_orders_mutex_);
+    if (symbol.empty())
+        return open_orders_cache_;
+    std::vector<order_info> out;
+    out.reserve(open_orders_cache_.size());
+    for (const auto& o : open_orders_cache_)
+    {
+        if (o.symbol == symbol)
+            out.push_back(o);
+    }
+    return out;
+}
+
+void binance_interface::refresh_open_order_cache_rest(const std::string& symbol)
+{
+    param_map params;
+    if (!symbol.empty())
+        params["symbol"] = symbol;
+    const std::string response = signed_fapi_rest(L"GET", "/fapi/v1/openOrders", std::move(params));
+    replace_open_order_cache(parse_open_orders(response));
 }
 
 orderbook_info binance_interface::parse_orderbook(const std::string& json, const std::string& symbol)
@@ -1799,6 +2143,28 @@ agg_trade_info binance_interface::parse_agg_trade(const std::string& json, const
 order_info binance_interface::parse_order(const std::string& json)
 {
     return parse_order_fields(extract_result_object(json));
+}
+
+order_info binance_interface::parse_user_stream_order(const std::string& order_obj)
+{
+    order_info order;
+    order.symbol = extract_json_string(order_obj, "s");
+    order.order_id = extract_json_int(order_obj, "i");
+    order.client_order_id = extract_json_string(order_obj, "c");
+    order.status = extract_json_string(order_obj, "X");
+    order.side = extract_json_string(order_obj, "S");
+    order.type = extract_json_string(order_obj, "o");
+    order.time_in_force = extract_json_string(order_obj, "f");
+    order.price = extract_json_string(order_obj, "p");
+    order.orig_qty = extract_json_string(order_obj, "q");
+    order.executed_qty = extract_json_string(order_obj, "z");
+    order.cummulative_quote_qty = extract_json_string(order_obj, "Z");
+    order.position_side = extract_json_string(order_obj, "ps");
+    order.transact_time = extract_json_int(order_obj, "T");
+    if (order.transact_time == 0)
+        order.transact_time = extract_json_int(order_obj, "E");
+    order.raw_json = order_obj;
+    return order;
 }
 
 std::vector<order_info> binance_interface::parse_open_orders(const std::string& json)

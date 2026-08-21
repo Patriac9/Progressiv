@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -167,9 +168,9 @@ public:
     order_info ws_get_order(long long order_id, std::string symbol = {});
     order_info ws_get_order(const std::string& client_order_id, std::string symbol = {});
 
-    // USD-M 合约：未成交挂单（openOrders.status）；symbol 空则查全部
+    // USD-M 合约：未成交挂单（User Data Stream 维护缓存；不再热路径 REST 轮询）
     std::vector<order_info> ws_open_orders(std::string symbol = {});
-    // USD-M 合约：持仓（account.position）；only_open=true 时过滤 |positionAmt|>0
+    // USD-M 合约：持仓（account.position，带短缓存）；only_open=true 时过滤 |positionAmt|>0
     std::vector<position_info> ws_get_positions(std::string symbol = {}, bool only_open = true);
     // USD-M 合约：取消单笔挂单（order.cancel）
     order_info ws_cancel_order(long long order_id, std::string symbol = {});
@@ -184,6 +185,8 @@ private:
     struct MarketChannel;
     struct FundingChannel;
     struct AggTradeChannel;
+    struct UserDataChannel;
+    friend struct UserDataChannel;
 
     std::string api_key_;
     std::string private_key_pem_;
@@ -206,12 +209,20 @@ private:
     std::unique_ptr<FundingChannel> funding_channel_;
     std::unique_ptr<AggTradeChannel> agg_trade_channel_;
     std::unique_ptr<AggTradeChannel> trade_agg_trade_channel_;
+    std::unique_ptr<UserDataChannel> user_data_channel_;
 
     order_info modify_order_ws(param_map cancel_id_params, order_request req);
     std::string ed25519_sign_base64(const std::string& message) const;
     std::string signed_ws_call(RpcChannel& channel, const std::string& method, param_map params) const;
     std::string signed_fapi_rest(const wchar_t* http_method, const std::string& path, param_map params) const;
     std::string resolve_symbol(std::string symbol) const;
+
+    void upsert_open_order_cache(const order_info& order);
+    void erase_open_order_cache(long long order_id);
+    void replace_open_order_cache(std::vector<order_info> orders);
+    std::vector<order_info> snapshot_open_order_cache(const std::string& symbol) const;
+    void refresh_open_order_cache_rest(const std::string& symbol); // 仅启动时可选 bootstrap
+    void invalidate_positions_cache();
 
     static std::vector<asset_balance> parse_balances(const std::string& json, bool omit_zero);
     static orderbook_info parse_orderbook(const std::string& json, const std::string& symbol);
@@ -220,9 +231,22 @@ private:
     static order_info parse_order(const std::string& json);
     static std::vector<order_info> parse_open_orders(const std::string& json);
     static std::vector<position_info> parse_positions(const std::string& json, bool only_open);
+    static order_info parse_user_stream_order(const std::string& order_obj);
     static std::string extract_result_object(const std::string& json);
     static void ensure_ws_ok(const std::string& json, const char* what);
     static long long now_ms();
+    static bool is_terminal_order_status(const std::string& status);
+
+    mutable std::mutex open_orders_mutex_;
+    mutable std::vector<order_info> open_orders_cache_;
+    mutable long long open_orders_cache_ms_ = 0;
+
+    mutable std::mutex positions_mutex_;
+    mutable std::vector<position_info> positions_cache_;
+    mutable std::string positions_cache_symbol_;
+    mutable bool positions_cache_only_open_ = true;
+    mutable long long positions_cache_ms_ = 0;
+    static constexpr long long kPositionsRefreshMs = 1000; // WS 持仓查询最多 1s 一次
 };
 
 #endif //PROGRESSIV_BINANCE_INTERFACE_H
