@@ -1049,7 +1049,7 @@ struct binance_interface::FundingChannel
 
 struct binance_interface::AggTradeChannel
 {
-    static constexpr long long kMaxKeepMs = 60000;
+    static constexpr long long kMaxKeepMs = 1800000; // 30m：TFI/CVD/VWAP
 
     std::string host;
     std::string symbol;
@@ -1114,6 +1114,35 @@ struct binance_interface::AggTradeChannel
         return trades.back();
     }
 
+    std::vector<agg_trade_info> snapshot(long long window_ms)
+    {
+        const long long now = binance_interface::now_ms();
+        if (window_ms < 0)
+            window_ms = 0;
+        if (window_ms > kMaxKeepMs)
+            window_ms = kMaxKeepMs;
+        std::lock_guard lock(mutex);
+        while (!trades.empty())
+        {
+            const long long t = trades.front().trade_time != 0
+                ? trades.front().trade_time
+                : trades.front().message_time;
+            if (now - t <= kMaxKeepMs)
+                break;
+            trades.pop_front();
+        }
+        std::vector<agg_trade_info> out;
+        for (auto it = trades.rbegin(); it != trades.rend(); ++it)
+        {
+            const long long t = it->trade_time != 0 ? it->trade_time : it->message_time;
+            if (now - t > window_ms)
+                break;
+            out.push_back(*it);
+        }
+        std::reverse(out.begin(), out.end());
+        return out;
+    }
+
     void push(agg_trade_info trade)
     {
         trade.message_time = binance_interface::now_ms();
@@ -1169,6 +1198,250 @@ struct binance_interface::AggTradeChannel
                     break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
             }
+        }
+    }
+};
+
+struct binance_interface::ForceOrderChannel
+{
+    static constexpr long long kMaxKeepMs = 1800000;
+
+    std::string host;
+    std::string symbol;
+    std::atomic<bool> running{false};
+    std::thread worker;
+    std::mutex mutex;
+    std::deque<force_order_info> events;
+
+    static long long event_t(const force_order_info& e)
+    {
+        if (e.trade_time != 0)
+            return e.trade_time;
+        if (e.event_time != 0)
+            return e.event_time;
+        return e.message_time;
+    }
+
+    void start(std::string h, std::string sym)
+    {
+        host = std::move(h);
+        symbol = std::move(sym);
+        if (running.exchange(true))
+            return;
+        worker = std::thread([this] { run(); });
+    }
+
+    void stop()
+    {
+        if (!running.exchange(false))
+            return;
+        if (worker.joinable())
+            worker.join();
+    }
+
+    void prune_locked(long long now)
+    {
+        while (!events.empty() && now - event_t(events.front()) > kMaxKeepMs)
+            events.pop_front();
+    }
+
+    void push(force_order_info ev)
+    {
+        ev.message_time = binance_interface::now_ms();
+        if (ev.trade_time == 0)
+            ev.trade_time = ev.message_time;
+        const long long now = ev.message_time;
+        std::lock_guard lock(mutex);
+        events.push_back(std::move(ev));
+        prune_locked(now);
+    }
+
+    force_order_info peek_last()
+    {
+        std::lock_guard lock(mutex);
+        if (events.empty())
+            return {};
+        return events.back();
+    }
+
+    std::vector<force_order_info> snapshot(long long window_ms)
+    {
+        const long long now = binance_interface::now_ms();
+        if (window_ms < 0)
+            window_ms = 0;
+        if (window_ms > kMaxKeepMs)
+            window_ms = kMaxKeepMs;
+        std::lock_guard lock(mutex);
+        prune_locked(now);
+        std::vector<force_order_info> out;
+        for (auto it = events.rbegin(); it != events.rend(); ++it)
+        {
+            if (now - event_t(*it) > window_ms)
+                break;
+            out.push_back(*it);
+        }
+        std::reverse(out.begin(), out.end());
+        return out;
+    }
+
+    liquidation_flow get_flow(long long window_ms)
+    {
+        liquidation_flow flow;
+        const auto rows = snapshot(window_ms);
+        for (const auto& e : rows)
+        {
+            float qty = e.filled_qty;
+            if (!(qty > 0.f))
+                qty = e.last_qty;
+            if (!(qty > 0.f))
+                qty = e.orig_qty;
+            if (!(qty > 0.f))
+                continue;
+            ++flow.count;
+            if (e.side == "SELL")
+                flow.long_qty += qty;
+            else if (e.side == "BUY")
+                flow.short_qty += qty;
+        }
+        flow.net_qty = flow.long_qty - flow.short_qty;
+        const float sum = flow.long_qty + flow.short_qty;
+        flow.imbalance = sum > 1e-12f ? flow.net_qty / sum : 0.f;
+        return flow;
+    }
+
+    void run()
+    {
+        std::string stream_symbol = symbol;
+        std::transform(stream_symbol.begin(), stream_symbol.end(), stream_symbol.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        const std::string path = "/market/ws/" + stream_symbol + "@forceOrder";
+
+        while (running)
+        {
+            try
+            {
+                WsConnection ws = ws_connect(host, path);
+                while (running)
+                {
+                    const std::string msg = ws_recv(ws);
+                    if (msg.empty())
+                        break;
+                    push(binance_interface::parse_force_order(msg, symbol));
+                }
+                ws.close();
+            }
+            catch (const std::exception& e)
+            {
+                std::cerr << "ForceOrderChannel WS error: " << e.what() << std::endl;
+                if (!running)
+                    break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+            catch (...)
+            {
+                std::cerr << "ForceOrderChannel WS unknown error" << std::endl;
+                if (!running)
+                    break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+        }
+    }
+};
+
+struct binance_interface::OpenInterestChannel
+{
+    static constexpr long long kMaxKeepMs = 1800000;
+    static constexpr long long kPollMs = 2000;
+
+    std::string rest_host;
+    std::string symbol;
+    std::atomic<bool> running{false};
+    std::thread worker;
+    std::mutex mutex;
+    std::deque<open_interest_info> samples;
+    bool has_data = false;
+
+    void start(std::string rest_h, std::string sym)
+    {
+        rest_host = std::move(rest_h);
+        symbol = std::move(sym);
+        if (running.exchange(true))
+            return;
+        worker = std::thread([this] { run(); });
+    }
+
+    void stop()
+    {
+        if (!running.exchange(false))
+            return;
+        if (worker.joinable())
+            worker.join();
+    }
+
+    void publish(open_interest_info info)
+    {
+        info.message_time = binance_interface::now_ms();
+        if (info.exchange_time == 0)
+            info.exchange_time = info.message_time;
+        const long long now = info.message_time;
+        std::lock_guard lock(mutex);
+        samples.push_back(std::move(info));
+        has_data = true;
+        while (!samples.empty() && now - samples.front().message_time > kMaxKeepMs)
+            samples.pop_front();
+    }
+
+    open_interest_info get_latest()
+    {
+        std::lock_guard lock(mutex);
+        if (!has_data || samples.empty())
+            return {};
+        return samples.back();
+    }
+
+    float change_rate(long long window_ms)
+    {
+        const long long now = binance_interface::now_ms();
+        if (window_ms < 0)
+            window_ms = 0;
+        std::lock_guard lock(mutex);
+        if (samples.size() < 2)
+            return 0.f;
+        const open_interest_info& latest = samples.back();
+        const open_interest_info* then = &samples.front();
+        for (const auto& s : samples)
+        {
+            const long long t = s.exchange_time != 0 ? s.exchange_time : s.message_time;
+            if (now - t >= window_ms)
+                then = &s;
+            else
+                break;
+        }
+        if (!(then->open_interest > 1e-12f))
+            return 0.f;
+        return (latest.open_interest - then->open_interest) / then->open_interest;
+    }
+
+    void run()
+    {
+        const std::string path = "/fapi/v1/openInterest?symbol=" + symbol;
+        while (running)
+        {
+            try
+            {
+                const std::string json = https_get(rest_host, path);
+                publish(binance_interface::parse_open_interest(json, symbol));
+            }
+            catch (const std::exception& e)
+            {
+                std::cerr << "OpenInterestChannel REST error: " << e.what() << std::endl;
+            }
+            catch (...)
+            {
+                std::cerr << "OpenInterestChannel REST unknown error" << std::endl;
+            }
+            for (int i = 0; i < 20 && running; ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(kPollMs / 20));
         }
     }
 };
@@ -1256,6 +1529,8 @@ void binance_interface::start(uint32_t depth_levels)
     market_channel_ = std::make_unique<MarketChannel>();
     funding_channel_ = std::make_unique<FundingChannel>();
     agg_trade_channel_ = std::make_unique<AggTradeChannel>();
+    force_order_channel_ = std::make_unique<ForceOrderChannel>();
+    open_interest_channel_ = std::make_unique<OpenInterestChannel>();
 
     balance_channel_->start(ws_api_host_);
     order_channel_->start(ws_api_host_);
@@ -1264,13 +1539,19 @@ void binance_interface::start(uint32_t depth_levels)
     market_channel_->start(ws_stream_host_, signal_symbol_, depth_levels);
     funding_channel_->start(ws_stream_host_, rest_host, signal_symbol_);
     agg_trade_channel_->start(ws_stream_host_, signal_symbol_);
+    force_order_channel_->start(ws_stream_host_, signal_symbol_);
+    open_interest_channel_->start(rest_host, signal_symbol_);
 
     if (split_trade_market_)
     {
         trade_market_channel_ = std::make_unique<MarketChannel>();
         trade_agg_trade_channel_ = std::make_unique<AggTradeChannel>();
+        trade_force_order_channel_ = std::make_unique<ForceOrderChannel>();
+        trade_open_interest_channel_ = std::make_unique<OpenInterestChannel>();
         trade_market_channel_->start(ws_stream_host_, trade_symbol_, depth_levels);
         trade_agg_trade_channel_->start(ws_stream_host_, trade_symbol_);
+        trade_force_order_channel_->start(ws_stream_host_, trade_symbol_);
+        trade_open_interest_channel_->start(rest_host, trade_symbol_);
     }
 
     user_data_channel_ = std::make_unique<UserDataChannel>();
@@ -1305,6 +1586,14 @@ void binance_interface::stop()
         agg_trade_channel_->stop();
     if (trade_agg_trade_channel_)
         trade_agg_trade_channel_->stop();
+    if (force_order_channel_)
+        force_order_channel_->stop();
+    if (trade_force_order_channel_)
+        trade_force_order_channel_->stop();
+    if (open_interest_channel_)
+        open_interest_channel_->stop();
+    if (trade_open_interest_channel_)
+        trade_open_interest_channel_->stop();
     if (balance_channel_)
         balance_channel_->stop();
     if (order_channel_)
@@ -1319,6 +1608,10 @@ void binance_interface::stop()
     funding_channel_.reset();
     agg_trade_channel_.reset();
     trade_agg_trade_channel_.reset();
+    force_order_channel_.reset();
+    trade_force_order_channel_.reset();
+    open_interest_channel_.reset();
+    trade_open_interest_channel_.reset();
     balance_channel_.reset();
     order_channel_.reset();
     futures_channel_.reset();
@@ -1338,14 +1631,11 @@ std::pair<std::string, std::string> binance_interface::parse_inst_id(const std::
         std::transform(line.begin(), line.end(), line.begin(),
                        [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
         symbols.push_back(std::move(line));
-        if (symbols.size() == 2)
-            break;
+        break;
     }
     if (symbols.empty())
         throw std::runtime_error("instId.cfg has no symbol");
-    if (symbols.size() == 1)
-        return {symbols[0], symbols[0]};
-    return {symbols[0], symbols[1]};
+    return {symbols[0], symbols[0]};
 }
 
 std::string binance_interface::resolve_symbol(std::string symbol) const
@@ -1424,6 +1714,66 @@ aggressor_flow binance_interface::get_ws_aggressor_flow(long long window_ms, boo
     if (!channel)
         throw std::runtime_error("aggTrade channel not started; call start() first");
     return channel->get_flow(window_ms);
+}
+
+std::vector<agg_trade_info> binance_interface::get_ws_agg_trades(long long window_ms, bool trade_market)
+{
+    AggTradeChannel* channel = (trade_market && trade_agg_trade_channel_)
+        ? trade_agg_trade_channel_.get()
+        : agg_trade_channel_.get();
+    if (!channel)
+        throw std::runtime_error("aggTrade channel not started; call start() first");
+    return channel->snapshot(window_ms);
+}
+
+force_order_info binance_interface::get_ws_last_force_order(bool trade_market)
+{
+    ForceOrderChannel* channel = (trade_market && trade_force_order_channel_)
+        ? trade_force_order_channel_.get()
+        : force_order_channel_.get();
+    if (!channel)
+        throw std::runtime_error("forceOrder channel not started; call start() first");
+    return channel->peek_last();
+}
+
+liquidation_flow binance_interface::get_ws_liquidation_flow(long long window_ms, bool trade_market)
+{
+    ForceOrderChannel* channel = (trade_market && trade_force_order_channel_)
+        ? trade_force_order_channel_.get()
+        : force_order_channel_.get();
+    if (!channel)
+        throw std::runtime_error("forceOrder channel not started; call start() first");
+    return channel->get_flow(window_ms);
+}
+
+std::vector<force_order_info> binance_interface::get_ws_force_orders(long long window_ms, bool trade_market)
+{
+    ForceOrderChannel* channel = (trade_market && trade_force_order_channel_)
+        ? trade_force_order_channel_.get()
+        : force_order_channel_.get();
+    if (!channel)
+        throw std::runtime_error("forceOrder channel not started; call start() first");
+    return channel->snapshot(window_ms);
+}
+
+open_interest_info binance_interface::get_ws_open_interest(bool trade_market)
+{
+    OpenInterestChannel* channel = (trade_market && trade_open_interest_channel_)
+        ? trade_open_interest_channel_.get()
+        : open_interest_channel_.get();
+    if (!channel)
+        throw std::runtime_error("openInterest channel not started; call start() first");
+    return channel->get_latest();
+}
+
+float binance_interface::get_ws_open_interest_change(long long window_ms, bool trade_market)
+{
+    OpenInterestChannel* channel = (trade_market && trade_open_interest_channel_)
+        ? trade_open_interest_channel_.get()
+        : open_interest_channel_.get();
+    if (!channel)
+        throw std::runtime_error("openInterest channel not started; call start() first");
+    return channel->change_rate(window_ms);
 }
 
 std::vector<asset_balance> binance_interface::get_ws_balance(bool omit_zero_balances)
@@ -2068,6 +2418,43 @@ agg_trade_info binance_interface::parse_agg_trade(const std::string& json, const
     if (trade.trade_time == 0)
         trade.trade_time = extract_json_int(json, "E");
     return trade;
+}
+
+force_order_info binance_interface::parse_force_order(const std::string& json, const std::string& symbol)
+{
+    const std::string o = extract_json_object(json, "o");
+    const std::string& payload = o.empty() ? json : o;
+
+    force_order_info info;
+    info.symbol = symbol;
+    const std::string sym = extract_json_string(payload, "s");
+    if (!sym.empty())
+        info.symbol = sym;
+    info.side = extract_json_string(payload, "S");
+    info.orig_qty = extract_json_float(payload, "q");
+    info.last_qty = extract_json_float(payload, "l");
+    info.filled_qty = extract_json_float(payload, "z");
+    info.price = extract_json_float(payload, "p");
+    info.avg_price = extract_json_float(payload, "ap");
+    if (!(info.avg_price > 0.f))
+        info.avg_price = info.price;
+    info.trade_time = extract_json_int(payload, "T");
+    info.event_time = extract_json_int(json, "E");
+    if (info.event_time == 0)
+        info.event_time = extract_json_int(payload, "T");
+    return info;
+}
+
+open_interest_info binance_interface::parse_open_interest(const std::string& json, const std::string& symbol)
+{
+    open_interest_info info;
+    info.symbol = symbol;
+    const std::string sym = extract_json_string(json, "symbol");
+    if (!sym.empty())
+        info.symbol = sym;
+    info.open_interest = extract_json_float(json, "openInterest");
+    info.exchange_time = extract_json_int(json, "time");
+    return info;
 }
 
 order_info binance_interface::parse_order(const std::string& json)

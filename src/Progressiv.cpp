@@ -3,28 +3,17 @@
 //
 
 #include "Progressiv.h"
-#include <algorithm>
 #include <chrono>
 #include <cctype>
-#include <cmath>
 #include <ctime>
 #include <filesystem>
 #include <iomanip>
-#include <map>
 #include <sstream>
 #include <string>
 #include <thread>
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
 #include "Binance_interface.h"
 #include "async_log.h"
 #include "loader.h"
-#include "script.h"
-#include "orderbook_script.h"
 
 namespace
 {
@@ -85,15 +74,6 @@ namespace
         return oss.str();
     }
 
-    float sum_level_qty(const std::vector<orderbook_level>& levels, size_t n)
-    {
-        float sum = 0.f;
-        const size_t count = std::min(n, levels.size());
-        for (size_t i = 0; i < count; ++i)
-            sum += levels[i].quantity;
-        return sum;
-    }
-
     void append_jsonl(const std::string& symbol, const std::string& day, const std::string& line)
     {
         if (symbol.empty() || day.empty() || day == "-")
@@ -102,104 +82,12 @@ namespace
         std::filesystem::create_directories(dir);
         async_log::instance().write_file(dir + "/" + day + ".jsonl", line);
     }
-
-    void append_lob_jsonl(const std::string& symbol, const std::string& day, const std::string& line)
-    {
-        if (symbol.empty() || day.empty() || day == "-")
-            return;
-        const std::string dir = "training_data/" + symbol;
-        std::filesystem::create_directories(dir);
-        async_log::instance().write_file(dir + "/" + day + ".lob.jsonl", line);
-    }
-
-    void append_farr(std::ostringstream& oss, const char* key, const float* a, int n)
-    {
-        oss << '"' << key << "\":[";
-        for (int i = 0; i < n; ++i)
-        {
-            if (i)
-                oss << ',';
-            oss << a[i];
-        }
-        oss << ']';
-    }
-
-    constexpr int kLobBuckets = 4;
-    constexpr float kLobEdge[4] = {0.0001f, 0.0002f, 0.0005f, 0.001f};
-
-    int lob_bucket(float px, float mid, bool is_ask)
-    {
-        if (!(mid > 0.f) || !(px > 0.f))
-            return -1;
-        const float d = is_ask ? (px - mid) / mid : (mid - px) / mid;
-        if (d < 0.f)
-            return 0;
-        for (int i = 0; i < kLobBuckets; ++i)
-        {
-            if (d <= kLobEdge[i] + 1e-12f)
-                return i;
-        }
-        return -1;
-    }
-
-    void lob_vol(const std::vector<orderbook_level>& bids,
-                 const std::vector<orderbook_level>& asks,
-                 float mid, float* vb, float* va)
-    {
-        for (int i = 0; i < kLobBuckets; ++i)
-            vb[i] = va[i] = 0.f;
-        for (const auto& lv : bids)
-        {
-            const int b = lob_bucket(lv.price, mid, false);
-            if (b >= 0)
-                vb[b] += lv.quantity;
-        }
-        for (const auto& lv : asks)
-        {
-            const int b = lob_bucket(lv.price, mid, true);
-            if (b >= 0)
-                va[b] += lv.quantity;
-        }
-    }
-
-    void lob_ofi_side(const std::vector<orderbook_level>& prev,
-                      const std::vector<orderbook_level>& cur,
-                      float mid, bool is_ask, float* ofi)
-    {
-        std::map<long long, float> a;
-        std::map<long long, float> b;
-        for (const auto& lv : prev)
-            a[std::llround(static_cast<double>(lv.price) * 1e8)] = lv.quantity;
-        for (const auto& lv : cur)
-            b[std::llround(static_cast<double>(lv.price) * 1e8)] = lv.quantity;
-
-        auto acc = [&](long long key, float dqty) {
-            if (dqty == 0.f)
-                return;
-            const float px = static_cast<float>(static_cast<double>(key) / 1e8);
-            const int bucket = lob_bucket(px, mid, is_ask);
-            if (bucket < 0)
-                return;
-            ofi[bucket] += is_ask ? -dqty : dqty;
-        };
-
-        for (const auto& kv : a)
-        {
-            const auto it = b.find(kv.first);
-            acc(kv.first, (it == b.end() ? 0.f : it->second) - kv.second);
-        }
-        for (const auto& kv : b)
-        {
-            if (!a.count(kv.first))
-                acc(kv.first, kv.second);
-        }
-    }
 }
 
 Progressiv::Progressiv()
 {
     interface_ = new binance_interface();
-    script = new orderbook_script();
+    mft_script_ = new mft_script();
 }
 
 void Progressiv::destroy()
@@ -207,20 +95,16 @@ void Progressiv::destroy()
     running_ = false;
     if (interface_)
         interface_->stop();
-    if (signal_thread_.joinable())
-        signal_thread_.join();
-    if (exec_thread_.joinable())
-        exec_thread_.join();
-    if (enable_training_capture)
-        flush_lob_bin();
+    if (data_thread_.joinable())
+        data_thread_.join();
     async_log::instance().stop();
 }
 
 Progressiv::~Progressiv()
 {
     destroy();
-    delete script;
-    script = nullptr;
+    delete mft_script_;
+    mft_script_ = nullptr;
     delete interface_;
     interface_ = nullptr;
 }
@@ -251,16 +135,15 @@ void Progressiv::init()
     if (use_testnet) interface_->init("demo_credential.cfg");
     else interface_->init("credential.cfg");
     interface_->start(20);
-    script->set_controller(this);
-    script->init(interface_->signal_symbol());
-    if (interface_->split_trade_market())
-        trade_tick_size_ = interface_->get_tick_size(interface_->trade_symbol());
-    else
-        trade_tick_size_ = 0.f;
+    if (mft_script_)
+    {
+        mft_script_->set_controller(this);
+        mft_script_->init(interface_->signal_symbol());
+    }
     async_log::instance().info("Progressiv init OK");
 }
 
-void Progressiv::signal_loop()
+void Progressiv::data_loop()
 {
     while (running_)
     {
@@ -275,18 +158,15 @@ void Progressiv::signal_loop()
 
             const auto compute_t0 = std::chrono::steady_clock::now();
             current_tick = current_orderbook.last_update_id;
-            std::string day;
+            if (mft_script_)
+                mft_script_->run();
             if (enable_training_capture)
             {
                 transaction_time = format_ms_timestamp(current_orderbook.transact_time);
                 message_time = format_ms_timestamp(current_orderbook.message_time);
-                day = (message_time.size() >= 8) ? message_time.substr(0, 8) : std::string{};
-                capture_lob_grid(day, current_orderbook);
+                const std::string day = (message_time.size() >= 8) ? message_time.substr(0, 8) : std::string{};
+                write_factors(day, message_time);
             }
-            // 直接 move，避免 asks/bids 二次拷贝；lob 必须在 move 之前写完
-            script->set_asks(std::move(current_orderbook.asks));
-            script->set_bids(std::move(current_orderbook.bids));
-            script->run_signal();
             const auto compute_us = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - compute_t0).count();
 
@@ -296,47 +176,14 @@ void Progressiv::signal_loop()
             async_log::instance().set_loop_metrics(
                 exch_lag_ms,
                 static_cast<double>(wait_us) / 1000.0,
-                static_cast<double>(compute_us) / 1000.0,
-                script->latest_signal().T);
-
-            if (enable_training_capture)
-            {
-                capture_signal_sample(day);
-                if (interface_->split_trade_market())
-                    capture_trade_sample(day, message_time);
-            }
+                static_cast<double>(compute_us) / 1000.0);
         }
         catch (const std::exception& e)
         {
             if (!running_)
                 break;
-            async_log::instance().error(std::string("signal loop: ") + e.what());
+            async_log::instance().error(std::string("data loop: ") + e.what());
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-    }
-}
-
-void Progressiv::execution_loop()
-{
-    uint64_t last_seq = 0;
-#ifdef _WIN32
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
-#endif
-    while (running_)
-    {
-        try
-        {
-            signal_snapshot snap;
-            if (!script->wait_take_signal(last_seq, snap, 50))
-                continue;
-            // 暂时不跑 run_execution：只算因子 / 落盘
-        }
-        catch (const std::exception& e)
-        {
-            async_log::instance().error(std::string("exec loop: ") + e.what());
-            if (!running_)
-                break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
     }
 }
@@ -344,223 +191,91 @@ void Progressiv::execution_loop()
 void Progressiv::run()
 {
     running_ = true;
-    async_log::instance().info("entering signal+exec threads");
-    signal_thread_ = std::thread([this] { signal_loop(); });
-    exec_thread_ = std::thread([this] { execution_loop(); });
-    if (signal_thread_.joinable())
-        signal_thread_.join();
+    async_log::instance().info("entering data thread");
+    data_thread_ = std::thread([this] { data_loop(); });
+    if (data_thread_.joinable())
+        data_thread_.join();
     running_ = false;
-    if (exec_thread_.joinable())
-        exec_thread_.join();
     async_log::instance().stop();
 }
 
-void Progressiv::capture_signal_sample(const std::string& day)
+void Progressiv::write_factors(const std::string& day, const std::string& signal_timestamp)
 {
-    const auto& o = script->output_;
+    if (!mft_script_ || !interface_ || day.empty() || day == "-")
+        return;
+
+    const data_stream& o = mft_script_->factors();
+    if (!(o.mid > 0.f) || o.t_unix_ms <= 0)
+        return;
+
+    const long long sec = o.t_unix_ms / 1000;
+    if (sec == last_factor_write_sec_)
+        return;
+    last_factor_write_sec_ = sec;
+
     std::ostringstream line;
-    line << std::setprecision(9)
-         << "{\"timestamp\":\"" << message_time << "\""
-         << ",\"transaction_time\":\"" << transaction_time << "\""
-         << ",\"tick\":" << current_tick
-         << ",\"obi\":" << o.obi
-         << ",\"mid_price\":" << o.mid_price
-         << ",\"ml_ofi_5s\":" << o.ml_ofi_5s
-         << ",\"ml_ofi_15s\":" << o.ml_ofi_15s
-         << ",\"ml_ofi_30s\":" << o.ml_ofi_30s
-         << ",\"ml_ofi_60s\":" << o.ml_ofi_60s
-         << ",\"n_mid_moves_30s\":" << o.n_mid_moves_30s
-         << ",\"n_mid_moves_60s\":" << o.n_mid_moves_60s
-         << ",\"rv_30s\":" << o.rv_30s
-         << ",\"rv_60s\":" << o.rv_60s
-         << ",\"aggressor_imb_5s\":" << o.aggressor_imb_5s
-         << ",\"d_ask_10bp\":" << o.d_ask_10bp
-         << ",\"d_bid_10bp\":" << o.d_bid_10bp
-         << ",\"d_imb_10bp\":" << o.d_imb_10bp
-         << ",\"cover_ask_10bp\":" << o.cover_ask_10bp
-         << ",\"cover_bid_10bp\":" << o.cover_bid_10bp
-         << ",\"r_ask\":" << o.r_ask
-         << ",\"r_bid\":" << o.r_bid
-         << ",\"t_clear_ask\":" << o.t_clear_ask
-         << ",\"t_clear_bid\":" << o.t_clear_bid
-         << ",\"t_clear_ask_h\":" << o.t_clear_ask_h
-         << ",\"t_clear_bid_h\":" << o.t_clear_bid_h
-         << ",\"d_ask_chg_1s\":" << o.d_ask_chg_1s
-         << ",\"d_bid_chg_1s\":" << o.d_bid_chg_1s
-         << ",\"gap_ask\":" << o.gap_ask
-         << ",\"gap_bid\":" << o.gap_bid
-         << ",\"gap_max_ask\":" << o.gap_max_ask
-         << ",\"gap_max_bid\":" << o.gap_max_bid
-         << ",\"gap_imb\":" << o.gap_imb
-         << ",\"bid_slope\":" << o.bid_slope
-         << ",\"ask_slope\":" << o.ask_slope
-         << ",\"slope_imb\":" << o.slope_imb
-         << ",\"refill_ask_50ms\":" << o.refill_ask_50ms
-         << ",\"refill_ask_100ms\":" << o.refill_ask_100ms
-         << ",\"refill_ask_250ms\":" << o.refill_ask_250ms
-         << ",\"refill_bid_50ms\":" << o.refill_bid_50ms
-         << ",\"refill_bid_100ms\":" << o.refill_bid_100ms
-         << ",\"refill_bid_250ms\":" << o.refill_bid_250ms
-         << ",\"hawkes_buy_mo\":" << o.hawkes_buy_mo
-         << ",\"hawkes_sell_mo\":" << o.hawkes_sell_mo
-         << ",\"hawkes_ask_add\":" << o.hawkes_ask_add
-         << ",\"hawkes_bid_add\":" << o.hawkes_bid_add
-         << ",\"hawkes_ask_cancel\":" << o.hawkes_ask_cancel
-         << ",\"hawkes_bid_cancel\":" << o.hawkes_bid_cancel
-         << ",\"ml_ofi_250ms\":" << o.ml_ofi_250ms
-         << ",\"ml_ofi_1s\":" << o.ml_ofi_1s
-         << ",\"ml_ofi_2s\":" << o.ml_ofi_2s
-         << ",\"ofi_tick\":" << o.ofi_tick
-         << ",\"l1_ofi_tick\":" << o.l1_ofi_tick
-         << ",\"ret_100ms\":" << o.ret_100ms
-         << ",\"ret_250ms\":" << o.ret_250ms
-         << ",\"ret_1s\":" << o.ret_1s
-         << ",\"ret_5s\":" << o.ret_5s
-         << ",\"aggressor_imb_250ms\":" << o.aggressor_imb_250ms
-         << ",\"aggressor_imb_1s\":" << o.aggressor_imb_1s
-         << ",\"aggressor_net_1s\":" << o.aggressor_net_1s
-         << ",\"last_trade_sign\":" << o.last_trade_sign
-         << ",\"last_trade_mid_bps\":" << o.last_trade_mid_bps
-         << ",\"last_trade_age_ms\":" << o.last_trade_age_ms
-         << ",\"sig_l1_imb\":" << o.sig_l1_imb
-         << ",\"sig_l3_imb\":" << o.sig_l3_imb
-         << ",\"sig_micro_off\":" << o.sig_micro_off
-         << ",\"sig_spread_ticks\":" << o.sig_spread_ticks
-         << ",\"hawkes_mo_imb\":" << o.hawkes_mo_imb
-         << ",\"hawkes_add_imb\":" << o.hawkes_add_imb
-         << ",\"hawkes_cancel_imb\":" << o.hawkes_cancel_imb
-         << ",\"r_imb\":" << o.r_imb
-         << ",\"d_chg_imb_1s\":" << o.d_chg_imb_1s
-         << ",\"refill_imb_100ms\":" << o.refill_imb_100ms
-         << ",\"cover_imb_10bp\":" << o.cover_imb_10bp
-         << ",\"exec_aggressor_imb_250ms\":" << o.exec_aggressor_imb_250ms
-         << ",\"exec_aggressor_imb_1s\":" << o.exec_aggressor_imb_1s
-         << ",\"basis\":" << o.basis
-         << ",\"basis_chg_1s\":" << o.basis_chg_1s
-         << ",\"T\":" << o.T
-         << ",\"alpha\":" << o.alpha
-         << "}\n";
+    line << std::setprecision(9);
+    auto f = [&](const char* k, float v) { line << ",\"" << k << "\":" << v; };
+    auto n = [&](const char* k, long long v) { line << ",\"" << k << "\":" << v; };
+
+    line << "{\"timestamp\":\"" << signal_timestamp << '"'
+         << ",\"transaction_time\":\"" << transaction_time << '"';
+    n("t_unix_ms", o.t_unix_ms);
+    n("tick", static_cast<long long>(o.tick));
+    f("bid", o.bid);
+    f("ask", o.ask);
+    f("mid", o.mid);
+    f("bid_qty", o.bid_qty);
+    f("ask_qty", o.ask_qty);
+    f("mark", o.mark);
+    f("index", o.index);
+    f("oi", o.oi);
+    f("rv_15s", o.rv_15s); f("rv_30s", o.rv_30s); f("rv_1m", o.rv_1m); f("rv_2m", o.rv_2m);
+    f("rv_5m", o.rv_5m); f("rv_15m", o.rv_15m); f("rv_30m", o.rv_30m);
+    f("sigma_15s", o.sigma_15s); f("sigma_30s", o.sigma_30s); f("sigma_1m", o.sigma_1m);
+    f("sigma_2m", o.sigma_2m); f("sigma_5m", o.sigma_5m); f("sigma_15m", o.sigma_15m);
+    f("sigma_30m", o.sigma_30m);
+    f("z_tp_60", o.z_tp_60); f("z_sl_60", o.z_sl_60);
+    f("z_tp_180", o.z_tp_180); f("z_sl_180", o.z_sl_180);
+    f("z_tp_300", o.z_tp_300); f("z_sl_300", o.z_sl_300);
+    f("rs_plus_1m", o.rs_plus_1m); f("rs_minus_1m", o.rs_minus_1m); f("rs_imb_1m", o.rs_imb_1m);
+    f("rs_plus_5m", o.rs_plus_5m); f("rs_minus_5m", o.rs_minus_5m); f("rs_imb_5m", o.rs_imb_5m);
+    f("hl_1m", o.hl_1m); f("hl_5m", o.hl_5m); f("hl_15m", o.hl_15m);
+    f("vvol_15m", o.vvol_15m); f("vvol_30m", o.vvol_30m);
+    f("vol_q", o.vol_q); f("drv", o.drv);
+    f("r_5s", o.r_5s); f("r_15s", o.r_15s); f("r_30s", o.r_30s); f("r_1m", o.r_1m);
+    f("r_2m", o.r_2m); f("r_5m", o.r_5m); f("r_10m", o.r_10m); f("r_30m", o.r_30m);
+    f("t_30s", o.t_30s); f("t_1m", o.t_1m); f("t_5m", o.t_5m); f("t_15m", o.t_15m);
+    f("dt_1m_5m", o.dt_1m_5m); f("r_acc_30s", o.r_acc_30s);
+    f("er_1m", o.er_1m); f("er_5m", o.er_5m); f("er_15m", o.er_15m);
+    f("pos_hl_5m", o.pos_hl_5m); f("pos_hl_15m", o.pos_hl_15m); f("pos_hl_30m", o.pos_hl_30m);
+    f("dist_hi_5m_bps", o.dist_hi_5m_bps); f("dist_lo_5m_bps", o.dist_lo_5m_bps);
+    f("dist_hi_15m_bps", o.dist_hi_15m_bps); f("dist_lo_15m_bps", o.dist_lo_15m_bps);
+    f("dist_hi_30m_bps", o.dist_hi_30m_bps); f("dist_lo_30m_bps", o.dist_lo_30m_bps);
+    f("d_vwap_1m", o.d_vwap_1m); f("d_vwap_5m", o.d_vwap_5m); f("d_vwap_30m", o.d_vwap_30m);
+    f("clv_1m", o.clv_1m); f("clv_5m", o.clv_5m);
+    f("wick_up_1m", o.wick_up_1m); f("wick_dn_1m", o.wick_dn_1m);
+    f("wick_up_5m", o.wick_up_5m); f("wick_dn_5m", o.wick_dn_5m);
+    f("tfi_5s", o.tfi_5s); f("tfi_15s", o.tfi_15s); f("tfi_30s", o.tfi_30s);
+    f("tfi_1m", o.tfi_1m); f("tfi_2m", o.tfi_2m); f("tfi_5m", o.tfi_5m);
+    n("run_len", o.run_len);
+    f("beta_cvd_1m", o.beta_cvd_1m); f("beta_cvd_5m", o.beta_cvd_5m);
+    f("t_cvd_1m", o.t_cvd_1m); f("t_cvd_5m", o.t_cvd_5m);
+    f("div_1m", o.div_1m); f("div_5m", o.div_5m); f("corr_px_cvd_5m", o.corr_px_cvd_5m);
+    f("vol_30s", o.vol_30s); f("vol_1m", o.vol_1m); f("vol_5m", o.vol_5m);
+    n("n_30s", o.n_30s); n("n_1m", o.n_1m); n("n_5m", o.n_5m);
+    f("nps_30s", o.nps_30s); f("nps_1m", o.nps_1m); f("nps_5m", o.nps_5m);
+    f("vol_acc", o.vol_acc);
+    f("spread_frac", o.spread_frac);
+    f("amihud_1m", o.amihud_1m); f("amihud_5m", o.amihud_5m);
+    f("lambda_1m", o.lambda_1m); f("lambda_5m", o.lambda_5m);
+    f("basis", o.basis); f("basis_z", o.basis_z); f("d_basis", o.d_basis);
+    f("funding", o.funding); f("t_to_fund_s", o.t_to_fund_s);
+    n("utc_minute", o.utc_minute); n("utc_hour", o.utc_hour);
+    f("is_m5", o.is_m5); f("is_m15", o.is_m15);
+    f("doi_1m", o.doi_1m); f("doi_5m", o.doi_5m); f("px_oi_1m", o.px_oi_1m);
+    f("liq_imb_30s", o.liq_imb_30s); f("liq_imb_5m", o.liq_imb_5m); f("liq_acc", o.liq_acc);
+    line << "}\n";
+
     append_jsonl(interface_->signal_symbol(), day, line.str());
 }
-
-void Progressiv::capture_trade_sample(const std::string& day, const std::string& signal_timestamp)
-{
-    try
-    {
-        second_orderbook = interface_->get_ws_trade_orderbook();
-    }
-    catch (const std::exception& e)
-    {
-        async_log::instance().error(std::string("trade orderbook not ready: ") + e.what());
-        return;
-    }
-
-    second_tick = second_orderbook.last_update_id;
-    const auto& trade_bids = second_orderbook.bids;
-    const auto& trade_asks = second_orderbook.asks;
-    if (trade_bids.empty() || trade_asks.empty())
-        return;
-
-    const float bid = trade_bids[0].price;
-    const float ask = trade_asks[0].price;
-    const float bid_qty = trade_bids[0].quantity;
-    const float ask_qty = trade_asks[0].quantity;
-    const float mid = 0.5f * (bid + ask);
-    const float tick_size = trade_tick_size_ > 0.f ? trade_tick_size_ : 0.01f;
-    const float spread_ticks = tick_size > 0.f ? (ask - bid) / tick_size : 0.f;
-    const agg_trade_info last_trade = interface_->get_ws_last_agg_trade(true);
-    const bool has_trade = last_trade.price > 0.f && last_trade.quantity > 0.f;
-
-    std::ostringstream line;
-    line << std::setprecision(9)
-         << "{\"timestamp\":\"" << format_ms_timestamp(second_orderbook.message_time) << "\""
-         << ",\"transaction_time\":\"" << format_ms_timestamp(second_orderbook.transact_time) << "\""
-         << ",\"signal_timestamp\":\"" << signal_timestamp << "\""
-         << ",\"tick\":" << second_tick
-         << ",\"tick_size\":" << tick_size
-         << ",\"bid\":" << bid
-         << ",\"ask\":" << ask
-         << ",\"bid_qty\":" << bid_qty
-         << ",\"ask_qty\":" << ask_qty
-         << ",\"mid_price\":" << mid
-         << ",\"spread_ticks\":" << spread_ticks
-         << ",\"bid_qty_5\":" << sum_level_qty(trade_bids, 5)
-         << ",\"ask_qty_5\":" << sum_level_qty(trade_asks, 5)
-         << ",\"bid_qty_10\":" << sum_level_qty(trade_bids, 10)
-         << ",\"ask_qty_10\":" << sum_level_qty(trade_asks, 10)
-         << ",\"has_trade\":" << (has_trade ? "true" : "false");
-    if (has_trade)
-    {
-        line << ",\"trade_price\":" << last_trade.price
-             << ",\"trade_qty\":" << last_trade.quantity
-             << ",\"trade_buyer_is_maker\":" << (last_trade.buyer_is_maker ? "true" : "false")
-             << ",\"trade_time\":\"" << format_ms_timestamp(last_trade.trade_time) << "\"";
-    }
-    line << "}\n";
-    append_jsonl(interface_->trade_symbol(), day, line.str());
-}
-
-void Progressiv::flush_lob_bin()
-{
-    if (lob_.bin_ms < 0 || lob_.day.empty() || !interface_)
-        return;
-    std::ostringstream line;
-    line << std::setprecision(9)
-         << "{\"timestamp\":\"" << format_ms_timestamp(lob_.bin_ms) << "\""
-         << ",\"t_unix_ms\":" << lob_.bin_ms
-         << ",\"grid_ms\":100"
-         << ",\"theta\":0.001"
-         << ",\"mid\":" << lob_.mid
-         << ",\"bucket_bp\":[1,2,5,10],";
-    append_farr(line, "vol_bid", lob_.vol_bid, kLobBuckets);
-    line << ',';
-    append_farr(line, "vol_ask", lob_.vol_ask, kLobBuckets);
-    line << ',';
-    append_farr(line, "ofi_bid", lob_.ofi_bid, kLobBuckets);
-    line << ',';
-    append_farr(line, "ofi_ask", lob_.ofi_ask, kLobBuckets);
-    line << "}\n";
-    append_lob_jsonl(interface_->signal_symbol(), lob_.day, line.str());
-}
-
-void Progressiv::capture_lob_grid(const std::string& day, const orderbook_info& book)
-{
-    if (book.bids.empty() || book.asks.empty() || day.empty())
-        return;
-    const float mid = 0.5f * (book.bids[0].price + book.asks[0].price);
-    const long long now = book.message_time > 0 ? book.message_time : book.transact_time;
-    if (now <= 0 || !(mid > 0.f))
-        return;
-
-    constexpr long long kGrid = 100;
-    const long long bin = (now / kGrid) * kGrid;
-
-    float d_ofi_b[kLobBuckets]{};
-    float d_ofi_a[kLobBuckets]{};
-    if (lob_.has_prev)
-    {
-        lob_ofi_side(lob_.prev_bids, book.bids, mid, false, d_ofi_b);
-        lob_ofi_side(lob_.prev_asks, book.asks, mid, true, d_ofi_a);
-    }
-
-    if (lob_.bin_ms >= 0 && bin != lob_.bin_ms)
-    {
-        flush_lob_bin();
-        for (int i = 0; i < kLobBuckets; ++i)
-            lob_.ofi_bid[i] = lob_.ofi_ask[i] = 0.f;
-    }
-
-    lob_.bin_ms = bin;
-    lob_.day = day;
-    lob_.mid = mid;
-    for (int i = 0; i < kLobBuckets; ++i)
-    {
-        lob_.ofi_bid[i] += d_ofi_b[i];
-        lob_.ofi_ask[i] += d_ofi_a[i];
-    }
-    lob_vol(book.bids, book.asks, mid, lob_.vol_bid, lob_.vol_ask);
-    lob_.prev_bids = book.bids;
-    lob_.prev_asks = book.asks;
-    lob_.has_prev = true;
-}
-

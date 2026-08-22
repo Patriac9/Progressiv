@@ -293,6 +293,8 @@ class SeqWindows:
         self.bin_idx = []
         self.t = []
         self.y = []
+        self.day_i = []
+        self.src_i = []
         F = len(feat_names)
         for di, d in enumerate(days):
             names = d["feat_names"]
@@ -328,6 +330,8 @@ class SeqWindows:
                     self.bin_idx.append(self.n_bins - 1)
                 self.t.append(float(di) * 86_400.0 + float(t_ms[i]) * 1e-3)
                 self.y.append(int(y[i]))
+                self.day_i.append(di)
+                self.src_i.append(i)
         if not self.X:
             raise RuntimeError("no sequence windows")
         self.X = np.stack(self.X, axis=0)
@@ -335,6 +339,8 @@ class SeqWindows:
         self.bin_idx = np.array(self.bin_idx, dtype=np.int64)
         self.t = np.array(self.t, dtype=np.float64)
         self.y = np.array(self.y, dtype=np.int8)
+        self.day_i = np.array(self.day_i, dtype=np.int32)
+        self.src_i = np.array(self.src_i, dtype=np.int32)
         if self.has_vol:
             self.vol = np.stack(self.vol, axis=0)
         if self.has_ofi:

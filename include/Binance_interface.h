@@ -67,6 +67,39 @@ struct aggressor_flow
     float imbalance = 0.f; // (buy-sell)/(buy+sell)
 };
 
+// USD-M 强平：@forceOrder。S=SELL 表示多头被强平，S=BUY 表示空头被强平
+struct force_order_info
+{
+    std::string symbol;
+    std::string side; // BUY / SELL
+    float orig_qty = 0.f;
+    float last_qty = 0.f;
+    float filled_qty = 0.f;
+    float price = 0.f;
+    float avg_price = 0.f;
+    long long trade_time = 0;
+    long long event_time = 0;
+    long long message_time = 0;
+};
+
+struct liquidation_flow
+{
+    float long_qty = 0.f;  // 多头强平（force SELL）
+    float short_qty = 0.f; // 空头强平（force BUY）
+    float net_qty = 0.f;   // long - short
+    float imbalance = 0.f;
+    int count = 0;
+};
+
+// /fapi/v1/openInterest：币安没有 OI websocket，后台线程轮询当流用
+struct open_interest_info
+{
+    std::string symbol;
+    float open_interest = 0.f;
+    long long exchange_time = 0;
+    long long message_time = 0;
+};
+
 struct order_request
 {
     std::string symbol;
@@ -132,7 +165,7 @@ public:
     void init(std::string credential_path);
     void set_credentials(const std::string& api_key, const std::string& ed25519_private_key_pem);
 
-    // instId.cfg：第 1 行行情对象，第 2 行买卖对象；只有一行则两者相同
+    // instId.cfg：只读第 1 行，行情与下单同一 symbol
     static std::pair<std::string, std::string> parse_inst_id(const std::string& content);
 
     // 启动三路长连接线程：行情 / 余额 / 订单
@@ -154,6 +187,15 @@ public:
     funding_info get_ws_funding_rate();
     // 读主动成交流（aggTrade 滚动窗口汇总）
     aggressor_flow get_ws_aggressor_flow(long long window_ms = 1000, bool trade_market = false);
+    // 窗内逐笔（时间正序）。窗上限 30 分钟，供 CVD/VWAP/1s bar
+    std::vector<agg_trade_info> get_ws_agg_trades(long long window_ms, bool trade_market = false);
+    // 强平：@forceOrder（/market 路由）；window 上限 30 分钟
+    force_order_info get_ws_last_force_order(bool trade_market = false);
+    liquidation_flow get_ws_liquidation_flow(long long window_ms = 60000, bool trade_market = false);
+    std::vector<force_order_info> get_ws_force_orders(long long window_ms, bool trade_market = false);
+    // 持仓量：REST 轮询缓存。change = (OI_now - OI_t-W) / OI_t-W
+    open_interest_info get_ws_open_interest(bool trade_market = false);
+    float get_ws_open_interest_change(long long window_ms, bool trade_market = false);
     // 经余额线程长连接发起 account.status
     std::vector<asset_balance> get_ws_balance(bool omit_zero_balances = true);
 
@@ -202,6 +244,8 @@ private:
     struct MarketChannel;
     struct FundingChannel;
     struct AggTradeChannel;
+    struct ForceOrderChannel;
+    struct OpenInterestChannel;
     struct UserDataChannel;
     friend struct UserDataChannel;
 
@@ -226,6 +270,10 @@ private:
     std::unique_ptr<FundingChannel> funding_channel_;
     std::unique_ptr<AggTradeChannel> agg_trade_channel_;
     std::unique_ptr<AggTradeChannel> trade_agg_trade_channel_;
+    std::unique_ptr<ForceOrderChannel> force_order_channel_;
+    std::unique_ptr<ForceOrderChannel> trade_force_order_channel_;
+    std::unique_ptr<OpenInterestChannel> open_interest_channel_;
+    std::unique_ptr<OpenInterestChannel> trade_open_interest_channel_;
     std::unique_ptr<UserDataChannel> user_data_channel_;
 
     order_info modify_order_ws(param_map cancel_id_params, order_request req);
@@ -244,6 +292,8 @@ private:
     static orderbook_info parse_orderbook(const std::string& json, const std::string& symbol);
     static funding_info parse_funding(const std::string& json, const std::string& symbol);
     static agg_trade_info parse_agg_trade(const std::string& json, const std::string& symbol);
+    static force_order_info parse_force_order(const std::string& json, const std::string& symbol);
+    static open_interest_info parse_open_interest(const std::string& json, const std::string& symbol);
     static order_info parse_order(const std::string& json);
     static std::vector<order_info> parse_open_orders(const std::string& json);
     static std::vector<position_info> parse_positions(const std::string& json, bool only_open);

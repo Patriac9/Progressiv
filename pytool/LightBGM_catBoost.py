@@ -20,8 +20,8 @@ from pathlib import Path
 
 import numpy as np
 
-HORIZON_S = 15.0
-THETA = 0.0009  # 相对 mid ±0.1%（=10bp）
+HORIZON_S = 6.0
+THETA = 0.0006  # 相对 mid ±0.1%（=10bp）
 WARMUP = timedelta(seconds=60)
 HORIZON_SLACK = timedelta(seconds=2)
 GRID_MS = 100  # PDF 因果网格
