@@ -1,0 +1,8 @@
+model = rv60_linear
+kind = linear
+intercept = 0.3141760904527848
+rv_60s = 0.3422385889724241
+scale = 1
+clip_min = 0.05
+clip_max = 0.78
+sl = opposite

@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>固定 ±0.1% 止盈止损 · 三态期望模型</title>
+  <style>
+    :root {
+      --bg: #111113;
+      --fg: #ececec;
+      --muted: #9b9ba3;
+      --line: #2a2a2e;
+      --card: #1a1a1d;
+      --accent: #6ea8fe;
+      --ok: #3dd68c;
+      --warn: #e6b84d;
+      --bad: #f07178;
+      --info: #7dc4e4;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg); }
+    body {
+      font: 15px/1.55 "Segoe UI", "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+      padding: 32px 28px 64px;
+    }
+    .wrap { max-width: 920px; margin: 0 auto; }
+    h1 { font-size: 24px; font-weight: 650; margin: 0 0 8px; letter-spacing: -0.02em; }
+    h2 { font-size: 16px; font-weight: 650; margin: 28px 0 8px; }
+    h3 { font-size: 13px; font-weight: 650; margin: 0 0 8px; }
+    p { margin: 0 0 10px; }
+    .muted { color: var(--muted); }
+    .small { font-size: 12px; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .toolbar { justify-content: space-between; margin-bottom: 18px; }
+    button {
+      background: var(--accent); color: #0b1220; border: 0; height: 28px;
+      padding: 0 12px; border-radius: 6px; font: 13px/28px inherit; cursor: pointer;
+    }
+    button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--line); }
+    a.inline { color: var(--accent); text-decoration: none; }
+    a.inline:hover { text-decoration: underline; }
+    .callout {
+      border: 1px solid var(--line); background: var(--card);
+      padding: 12px 14px; border-radius: 8px; margin: 14px 0;
+    }
+    .callout b { display: block; margin-bottom: 4px; }
+    .callout.ok { border-color: #245c40; }
+    .callout.bad { border-color: #6b2a30; }
+    .callout.warn { border-color: #6b5420; }
+    .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 16px 0; }
+    .stat { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+    .stat .v { font-size: 22px; font-weight: 650; letter-spacing: -0.03em; }
+    .stat .l { font-size: 12px; color: var(--muted); margin-top: 4px; }
+    .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+    .card { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin: 16px 0 8px; }
+    .card-h { font-size: 12px; padding: 8px 14px; border-bottom: 1px solid var(--line); color: var(--muted); display: flex; justify-content: space-between; }
+    .card-b { padding: 14px; }
+    label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+    input {
+      width: 100%; height: 28px; background: var(--bg); color: var(--fg);
+      border: 1px solid var(--line); border-radius: 6px; padding: 0 8px; font: inherit;
+    }
+    .grid4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    .chip {
+      height: 24px; padding: 0 10px; border-radius: 999px; border: 1px solid var(--line);
+      background: transparent; color: var(--fg); font-size: 12px; cursor: pointer;
+    }
+    .chip.on { background: #2a3344; border-color: #3d4d66; }
+    .formula {
+      font-family: "Cambria Math", "Times New Roman", serif;
+      font-size: 15px; padding: 8px 0;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 7px 8px; border-bottom: 1px solid var(--line); text-align: right; }
+    th { color: var(--muted); font-weight: 550; font-size: 12px; }
+    td:last-child, th:last-child { text-align: left; }
+    tr.good td:first-child { box-shadow: inset 3px 0 0 var(--ok); }
+    tr.bad td:first-child { box-shadow: inset 3px 0 0 var(--bad); }
+    svg.chart { width: 100%; height: 240px; display: block; margin: 8px 0 4px; }
+    .src { color: #6f6f76; font-size: 11px; margin-top: 18px; }
+    @media (max-width: 800px) {
+      .stats, .grid4, .grid2 { grid-template-columns: 1fr 1fr; }
+    }
+    @media print {
+      :root { --bg: #fff; --fg: #111; --muted: #555; --line: #ccc; --card: #f7f7f7; }
+      body { background: #fff; color: #111; padding: 12mm; }
+      .noprint { display: none !important; }
+      .card, .callout, .stat { break-inside: avoid; }
+      button { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="row toolbar noprint">
+      <span class="muted small">
+        固定 ±0.1% 版 ·
+        <a class="inline" href="tp-sl-expectancy-x.html">打开 x 可变版</a>
+      </span>
+      <div class="row">
+        <button class="ghost" type="button" id="btn-reset">复位参数</button>
+        <button type="button" id="btn-print">打印 / 另存 PDF</button>
+      </div>
+    </div>
+
+    <h1>固定 ±0.1%：临界胜率只剩 a 与超时 e</h1>
+    <p class="muted" id="lead"></p>
+
+    <div class="callout ok" id="headline">
+      <b>无超时时 a &gt; 72.88%</b>
+      a*(e) = (1.72 − e) / 2.36。超时替代止损会把所需 a 往下推，但 a 不能超过 1−e。约 e≥47% 时即使剩下的全止盈也不够补超时损耗。
+    </div>
+
+    <div class="stats">
+      <div class="stat"><div class="v warn" id="s-star0">72.88%</div><div class="l">保守临界 a*（e=0）</div></div>
+      <div class="stat"><div class="v" id="s-stare">—</div><div class="l" id="s-stare-l">含超时后 a*</div></div>
+      <div class="stat"><div class="v ok">+0.64</div><div class="l">止盈净利 +1.00 − 0.36</div></div>
+      <div class="stat"><div class="v" id="s-ev">—</div><div class="l">单笔期望 E[R]</div></div>
+    </div>
+
+    <div class="card">
+      <div class="card-h"><span>参数演算</span><span id="badge">EV</span></div>
+      <div class="card-b">
+        <div class="grid4">
+          <div><label>止盈概率 a（%）</label><input id="aPct" type="number" value="80" min="0" max="100" step="0.1" /></div>
+          <div><label>超时退出 e（%）</label><input id="ePct" type="number" value="20" min="0" max="100" step="0.1" /></div>
+          <div><label>交易次数 n</label><input id="nTrades" type="number" value="100" min="1" max="500" step="1" /></div>
+          <div><label>标的价格 P（换算 tp_offset）</label><input id="price" type="number" value="2343" min="1" step="0.01" /></div>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <span class="muted small">a</span>
+          <button class="chip" data-k="aPct" data-v="70" type="button">70%</button>
+          <button class="chip" data-k="aPct" data-v="73" type="button">73%</button>
+          <button class="chip" data-k="aPct" data-v="75" type="button">75%</button>
+          <button class="chip" data-k="aPct" data-v="80" type="button">80%</button>
+          <button class="chip" data-k="aPct" data-v="85" type="button">85%</button>
+          <button class="chip" data-k="aPct" data-v="90" type="button">90%</button>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <span class="muted small">超时 e</span>
+          <button class="chip" data-k="ePct" data-v="0" type="button">0%</button>
+          <button class="chip" data-k="ePct" data-v="10" type="button">10%</button>
+          <button class="chip" data-k="ePct" data-v="20" type="button">20%</button>
+          <button class="chip" data-k="ePct" data-v="30" type="button">30%</button>
+          <button class="chip" data-k="ePct" data-v="40" type="button">40%</button>
+        </div>
+        <div class="callout" id="verdict" style="margin-bottom:0;margin-top:14px"></div>
+      </div>
+    </div>
+
+    <h2>超时越多，所需 a 越低，但上限也更紧</h2>
+    <p class="muted small">蓝线是 a 的物理上限 1−e。红线是盈亏平衡 a*。两线约在 e=47% 相交。</p>
+    <svg class="chart" id="chart-e" viewBox="0 0 900 240"></svg>
+    <p class="muted small">横轴：超时占比 e · 止盈/止损固定 ±0.1% · N=1000 · 赢 0.036% / 止损与超时 0.072%</p>
+
+    <h2>固定超时时，期望随 a 上升</h2>
+    <p class="muted small" id="ev-caption"></p>
+    <svg class="chart" id="chart-a" viewBox="0 0 900 240"></svg>
+
+    <h2>模型</h2>
+    <p>名义 N=1000。止盈 +0.1%（毛利 1.00），止损 −0.1%（毛亏 1.00）。赢边手续费 0.36，止损/超时各 0.72。</p>
+    <p>三种结局：止盈净利 +0.64（概率 a），止损净亏 −1.72（概率 b），超时净亏 −0.72（概率 e），a+b+e=1。</p>
+    <p class="formula">E[R] = 0.64a − 1.72b − 0.72e = 2.36a + e − 1.72</p>
+    <p>令 E[R] &gt; 0：</p>
+    <p class="formula">a*(e) = (1.72 − e) / 2.36</p>
+    <p>e=0 → a &gt; 72.88%。若 a 是「先碰到 TP/SL 的条件胜率」w=a/(1−e)，则 w* = (1 + 0.72/(1−e)) / 2.36。超时越多，碰到障碍的那些单越要更准。</p>
+
+    <div class="grid2" style="margin-top:16px">
+      <div>
+        <h3>超时 e 怎么改写 a*</h3>
+        <table id="tbl-e"></table>
+      </div>
+      <div>
+        <h3 id="tbl-a-h">当前超时时各胜率的期望</h3>
+        <table id="tbl-a"></table>
+      </div>
+    </div>
+    <p class="src">源：三态期望 · N=1000 · TP/SL=±0.1% · 赢 0.036% / 止损与超时 0.072% · P(利润&gt;0) 为正态近似 · 与 Progressiv canvas tp-sl-expectancy-model 互通</p>
+
+    <h2>怎么取才算稳</h2>
+    <p>无超时：a 至少 73%，稳一点用 78% 以上（约 +5pp）。有 20% 超时时临界降到 64.4%，但条件胜率反而要到约 80.5%——超时单每笔白亏 0.72，要靠打中的那些单补贴。</p>
+  </div>
+
+<script>
+(function () {
+  const N = 1000, R = 0.001, X = 1, C_WIN = 0.36, C_LOSS = 0.72, C_EXIT = 0.72;
+  const WIN_NET = 0.64, LOSS_NET = -1.72, EXIT_NET = -0.72;
+
+  const $ = (id) => document.getElementById(id);
+  const clamp01 = (p) => Math.max(0, Math.min(1, p));
+  const parsePos = (el, fb) => {
+    const v = Number(el.value);
+    return Number.isFinite(v) && v >= 0 ? v : fb;
+  };
+  const fmt = (n, d = 2) => Number.isFinite(n)
+    ? n.toLocaleString("zh-CN", { minimumFractionDigits: d, maximumFractionDigits: d })
+    : "—";
+  const fmtPct = (p, d = 2) => Number.isFinite(p) ? (p * 100).toFixed(d) + "%" : "—";
+  const signed = (n, d = 3) => {
+    if (!Number.isFinite(n)) return "—";
+    const b = fmt(Math.abs(n), d);
+    return n > 0 ? "+" + b : n < 0 ? "−" + b : b;
+  };
+
+  function aStar(e) { return (X + C_LOSS - e * X) / (2 * X + C_LOSS - C_WIN); }
+  function evOf(a, e) {
+    const b = 1 - a - e;
+    return a * WIN_NET + b * LOSS_NET + e * EXIT_NET;
+  }
+  function erf(z) {
+    const sign = z < 0 ? -1 : 1;
+    const t = 1 / (1 + 0.3275911 * Math.abs(z));
+    const y = 1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-z * z);
+    return sign * y;
+  }
+  function pProfitNormal(n, a, e) {
+    const b = Math.max(0, 1 - a - e);
+    const mu = a * WIN_NET + b * LOSS_NET + e * EXIT_NET;
+    const m2 = a * WIN_NET ** 2 + b * LOSS_NET ** 2 + e * EXIT_NET ** 2;
+    const var1 = Math.max(m2 - mu * mu, 1e-18);
+    const z = (0 - n * mu) / Math.sqrt(n * var1);
+    return clamp01(1 - 0.5 * (1 + erf(z / Math.SQRT2)));
+  }
+
+  function toneClass(t) { return t === "ok" ? "ok" : t === "bad" ? "bad" : t === "warn" ? "warn" : ""; }
+
+  function lineChart(svg, series, cats, yMin, yMax, zeroLine) {
+    const W = 900, H = 240, pad = { l: 48, r: 16, t: 16, b: 36 };
+    const iw = W - pad.l - pad.r, ih = H - pad.t - pad.b;
+    const xAt = (i) => pad.l + (cats.length <= 1 ? iw / 2 : (i / (cats.length - 1)) * iw);
+    const yAt = (v) => pad.t + (1 - (v - yMin) / (yMax - yMin)) * ih;
+    const colors = { danger: "#f07178", info: "#7dc4e4", success: "#3dd68c", warn: "#e6b84d" };
+    let g = "";
+    const ticks = 5;
+    for (let i = 0; i <= ticks; i++) {
+      const v = yMin + (yMax - yMin) * (i / ticks);
+      const y = yAt(v);
+      g += `<line x1="${pad.l}" y1="${y}" x2="${W - pad.r}" y2="${y}" stroke="#2a2a2e" />`;
+      g += `<text x="${pad.l - 8}" y="${y + 4}" text-anchor="end" fill="#9b9ba3" font-size="11">${v.toFixed(0)}</text>`;
+    }
+    if (zeroLine != null && zeroLine >= yMin && zeroLine <= yMax) {
+      const y = yAt(zeroLine);
+      g += `<line x1="${pad.l}" y1="${y}" x2="${W - pad.r}" y2="${y}" stroke="#9b9ba3" stroke-dasharray="4 4" />`;
+      g += `<text x="${W - pad.r}" y="${y - 6}" text-anchor="end" fill="#9b9ba3" font-size="11">盈亏平衡</text>`;
+    }
+    cats.forEach((c, i) => {
+      g += `<text x="${xAt(i)}" y="${H - 10}" text-anchor="middle" fill="#9b9ba3" font-size="11">${c}</text>`;
+    });
+    series.forEach((s) => {
+      const col = colors[s.tone] || "#6ea8fe";
+      const pts = s.data.map((v, i) => `${xAt(i)},${yAt(v)}`).join(" ");
+      const area = `${xAt(0)},${yAt(yMin)} ${pts} ${xAt(s.data.length - 1)},${yAt(yMin)}`;
+      g += `<polygon points="${area}" fill="${col}" opacity="0.12" />`;
+      g += `<polyline fill="none" stroke="${col}" stroke-width="2" points="${pts}" />`;
+      s.data.forEach((v, i) => {
+        g += `<circle cx="${xAt(i)}" cy="${yAt(v)}" r="3" fill="${col}" />`;
+      });
+    });
+    const legendY = 14;
+    series.forEach((s, i) => {
+      const col = colors[s.tone] || "#6ea8fe";
+      const x = pad.l + i * 140;
+      g += `<rect x="${x}" y="${legendY - 8}" width="10" height="10" fill="${col}" />`;
+      g += `<text x="${x + 16}" y="${legendY}" fill="#ececec" font-size="12">${s.name}</text>`;
+    });
+    svg.innerHTML = g;
+  }
+
+  function render() {
+    const a = clamp01(parsePos($("aPct"), 80) / 100);
+    const eRaw = clamp01(parsePos($("ePct"), 20) / 100);
+    const e = Math.min(eRaw, 1 - a);
+    const n = Math.min(500, Math.max(1, Math.round(parsePos($("nTrades"), 100))));
+    const price = parsePos($("price"), 2343) || 2343;
+    const b = Math.max(0, 1 - a - e);
+    const tp = R * price;
+    const star0 = aStar(0);
+    const starE = aStar(e);
+    const maxA = 1 - e;
+    const feasible = starE <= maxA + 1e-12;
+    const ev1 = evOf(a, e);
+    const evN = n * ev1;
+    const pP = pProfitNormal(n, a, e);
+    const profitable = ev1 > 1e-12;
+    const breakeven = Math.abs(ev1) <= 1e-12;
+    const wHit = a + b > 1e-12 ? a / (a + b) : 0;
+    const wHitStar = e < 1 ? (X + C_LOSS / (1 - e)) / (2 * X + C_LOSS - C_WIN) : Infinity;
+
+    $("lead").textContent =
+      `名义 N=1000。止盈 +0.1%（毛利 1.00），止损 −0.1%（毛亏 1.00）。赢边手续费 0.36，止损/超时各 0.72。ETH 价 ${fmt(price, 0)} 时对应 tp_offset≈${fmt(tp, 2)}。`;
+
+    const stareEl = $("s-stare");
+    stareEl.textContent = feasible ? fmtPct(starE, 2) : "不可达";
+    stareEl.className = "v " + (feasible ? "ok" : "bad");
+    $("s-stare-l").textContent = `含超时后 a*（e=${fmtPct(e, 0)}）`;
+
+    const evEl = $("s-ev");
+    evEl.textContent = signed(ev1, 3);
+    evEl.className = "v " + (profitable ? "ok" : breakeven ? "warn" : "bad");
+
+    $("badge").textContent = profitable ? "EV > 0" : breakeven ? "EV = 0" : "EV < 0";
+
+    let title, cls;
+    if (!feasible) {
+      title = `超时 ${fmtPct(e, 0)} 时 a 最多 ${fmtPct(maxA, 1)}，低于所需 ${fmtPct(starE, 2)}`;
+      cls = "bad";
+    } else if (profitable) {
+      title = `当前 a = ${fmtPct(a, 1)} > ${fmtPct(starE, 2)}，期望盈利`;
+      cls = "ok";
+    } else if (breakeven) {
+      title = "当前参数恰好在临界点";
+      cls = "warn";
+    } else {
+      title = `当前 a = ${fmtPct(a, 1)} < ${fmtPct(starE, 2)}，期望亏损`;
+      cls = "bad";
+    }
+    const wNote = Number.isFinite(wHitStar) ? `（临界 ${fmtPct(wHitStar, 2)}）` : "";
+    $("verdict").className = "callout " + cls;
+    $("verdict").innerHTML =
+      `<b>${title}</b>止盈净利 ${signed(WIN_NET, 2)}，止损净亏 ${signed(LOSS_NET, 2)}，超时净亏 ${signed(EXIT_NET, 2)}。` +
+      `当前拆分：止盈 ${fmtPct(a, 1)} / 止损 ${fmtPct(b, 1)} / 超时 ${fmtPct(e, 1)}。${n} 次总期望 ${signed(evN, 2)}；` +
+      `正态近似 P(利润&gt;0)=${fmtPct(pP, 1)}。障碍条件胜率 ${fmtPct(wHit, 1)}${wNote}。`;
+
+    document.querySelectorAll(".chip").forEach((el) => {
+      el.classList.toggle("on", $(el.dataset.k).value === el.dataset.v);
+    });
+
+    const eGrid = [0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5];
+    lineChart(
+      $("chart-e"),
+      [
+        { name: "临界胜率 a*", tone: "danger", data: eGrid.map((ei) => {
+          const s = aStar(ei);
+          return s <= 1 - ei + 1e-9 ? s * 100 : 100;
+        }) },
+        { name: "a 上限 1−e", tone: "info", data: eGrid.map((ei) => (1 - ei) * 100) },
+      ],
+      eGrid.map((ei) => fmtPct(ei, 0)),
+      40,
+      100
+    );
+
+    const aGrid = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1];
+    const evSeries = aGrid.map((p) => n * evOf(p, Math.min(e, 1 - p)));
+    const ymin = Math.min(0, ...evSeries);
+    const ymax = Math.max(0, ...evSeries);
+    const padY = Math.max(4, (ymax - ymin) * 0.12 || 8);
+    $("ev-caption").textContent =
+      `当前 e=${fmtPct(e, 0)}。纵轴为 ${n} 次总期望。零轴交点 a*=${feasible ? fmtPct(starE, 2) : "不可达"}。`;
+    lineChart(
+      $("chart-a"),
+      [{ name: `n=${n} 时期望利润`, tone: profitable ? "success" : "danger", data: evSeries }],
+      aGrid.map((p) => fmtPct(p, 0)),
+      ymin - padY,
+      ymax + padY,
+      0
+    );
+
+    const eTable = [0, 0.1, 0.2, 0.3, 0.4, 0.5];
+    let eHtml = "<thead><tr><th>超时 e</th><th>所需 a</th><th>a 上限</th><th>条件胜率 w*</th><th>a*+5pp 时单笔 EV</th></tr></thead><tbody>";
+    eTable.forEach((ei) => {
+      const s = aStar(ei);
+      const cap = 1 - ei;
+      const ok = s <= cap + 1e-9;
+      const w = ei < 1 ? (X + C_LOSS / (1 - ei)) / (2 * X + C_LOSS - C_WIN) : Infinity;
+      eHtml += `<tr class="${ok ? "good" : "bad"}"><td>${fmtPct(ei, 0)}</td><td>${ok ? "a > " + fmtPct(s, 2) : "不可达"}</td><td>${fmtPct(cap, 0)}</td><td>${Number.isFinite(w) ? fmtPct(w, 2) : "—"}</td><td>${ok ? signed(evOf(Math.min(1, s + 0.05), ei), 3) : "—"}</td></tr>`;
+    });
+    $("tbl-e").innerHTML = eHtml + "</tbody>";
+
+    $("tbl-a-h").textContent = `当前超时时各胜率的期望（e=${fmtPct(e, 0)}，n=${n}）`;
+    const aTable = [0.65, 0.7, 0.729, 0.75, 0.8, 0.85, 0.9];
+    let aHtml = `<thead><tr><th>a</th><th>单笔期望</th><th>${n} 次期望</th><th>P(利润&gt;0)</th><th>结论</th></tr></thead><tbody>`;
+    aTable.forEach((p) => {
+      const ei = Math.min(e, 1 - p);
+      const e1 = evOf(p, ei);
+      const conc = e1 > 1e-12 ? "期望盈利" : e1 < -1e-12 ? "期望亏损" : "期望打平";
+      const cls = e1 > 1e-12 ? "good" : e1 < -1e-12 ? "bad" : "";
+      aHtml += `<tr class="${cls}"><td>${fmtPct(p, 1)}</td><td>${signed(e1, 3)}</td><td>${signed(n * e1, 2)}</td><td>${fmtPct(pProfitNormal(n, p, ei), 1)}</td><td>${conc}</td></tr>`;
+    });
+    $("tbl-a").innerHTML = aHtml + "</tbody>";
+  }
+
+  ["aPct", "ePct", "nTrades", "price"].forEach((id) => $(id).addEventListener("input", render));
+  document.querySelectorAll(".chip").forEach((el) => {
+    el.addEventListener("click", () => {
+      $(el.dataset.k).value = el.dataset.v;
+      render();
+    });
+  });
+  $("btn-print").addEventListener("click", () => window.print());
+  $("btn-reset").addEventListener("click", () => {
+    $("aPct").value = "80";
+    $("ePct").value = "20";
+    $("nTrades").value = "100";
+    $("price").value = "2343";
+    render();
+  });
+  render();
+})();
+</script>
+</body>
+</html>

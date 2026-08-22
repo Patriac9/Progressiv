@@ -1,0 +1,4 @@
+#Zym20060011240033
+ssh -t FrZZZ@lish-ap-northeast.linode.com ubuntu-ap-northeast
+ssh root@139.162.96.188
+139.162.96.188
