@@ -5,11 +5,11 @@ from pathlib import Path
 
 import numpy as np
 
-horizon = 13  # Position lasting time (seconds)
+horizon = 10  # Position lasting time (seconds)
 TAKER_FEE = 0  # flip / horizon / eod 吃单
 MAKER_FEE = 0  # 建仓 / TP 挂单
 QTY = 2  # 1 张标的
-TP_OFFSET = 0.08  # 止盈/止损距离：开仓价 ± offset
+TP_OFFSET = 0.09  # 止盈/止损距离：开仓价 ± offset
 ALPHA_TP_SCALE = 1.0  # 动态 TP/SL = clip(scale * alpha_hat)
 ALPHA_CLIP_Q = 0.80  # 动态上限用训练集 alpha 分位，避免 vol_exp 撑到数个点
 ALPHA_CLIP_MULT = 6.0  # 动态上限不超过 TP_OFFSET 的倍数
@@ -168,6 +168,8 @@ FEATURE_KEYS = [
     "obi",
     "ml_ofi_5s",
     "ml_ofi_15s",
+    "ml_ofi_30s",
+    "ml_ofi_60s",
 ]
 WARMUP = timedelta(seconds=60)
 

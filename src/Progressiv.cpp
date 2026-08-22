@@ -6,12 +6,20 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <cmath>
 #include <ctime>
 #include <filesystem>
 #include <iomanip>
+#include <map>
 #include <sstream>
 #include <string>
 #include <thread>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include "Binance_interface.h"
 #include "async_log.h"
 #include "loader.h"
@@ -94,6 +102,98 @@ namespace
         std::filesystem::create_directories(dir);
         async_log::instance().write_file(dir + "/" + day + ".jsonl", line);
     }
+
+    void append_lob_jsonl(const std::string& symbol, const std::string& day, const std::string& line)
+    {
+        if (symbol.empty() || day.empty() || day == "-")
+            return;
+        const std::string dir = "training_data/" + symbol;
+        std::filesystem::create_directories(dir);
+        async_log::instance().write_file(dir + "/" + day + ".lob.jsonl", line);
+    }
+
+    void append_farr(std::ostringstream& oss, const char* key, const float* a, int n)
+    {
+        oss << '"' << key << "\":[";
+        for (int i = 0; i < n; ++i)
+        {
+            if (i)
+                oss << ',';
+            oss << a[i];
+        }
+        oss << ']';
+    }
+
+    constexpr int kLobBuckets = 4;
+    constexpr float kLobEdge[4] = {0.0001f, 0.0002f, 0.0005f, 0.001f};
+
+    int lob_bucket(float px, float mid, bool is_ask)
+    {
+        if (!(mid > 0.f) || !(px > 0.f))
+            return -1;
+        const float d = is_ask ? (px - mid) / mid : (mid - px) / mid;
+        if (d < 0.f)
+            return 0;
+        for (int i = 0; i < kLobBuckets; ++i)
+        {
+            if (d <= kLobEdge[i] + 1e-12f)
+                return i;
+        }
+        return -1;
+    }
+
+    void lob_vol(const std::vector<orderbook_level>& bids,
+                 const std::vector<orderbook_level>& asks,
+                 float mid, float* vb, float* va)
+    {
+        for (int i = 0; i < kLobBuckets; ++i)
+            vb[i] = va[i] = 0.f;
+        for (const auto& lv : bids)
+        {
+            const int b = lob_bucket(lv.price, mid, false);
+            if (b >= 0)
+                vb[b] += lv.quantity;
+        }
+        for (const auto& lv : asks)
+        {
+            const int b = lob_bucket(lv.price, mid, true);
+            if (b >= 0)
+                va[b] += lv.quantity;
+        }
+    }
+
+    void lob_ofi_side(const std::vector<orderbook_level>& prev,
+                      const std::vector<orderbook_level>& cur,
+                      float mid, bool is_ask, float* ofi)
+    {
+        std::map<long long, float> a;
+        std::map<long long, float> b;
+        for (const auto& lv : prev)
+            a[std::llround(static_cast<double>(lv.price) * 1e8)] = lv.quantity;
+        for (const auto& lv : cur)
+            b[std::llround(static_cast<double>(lv.price) * 1e8)] = lv.quantity;
+
+        auto acc = [&](long long key, float dqty) {
+            if (dqty == 0.f)
+                return;
+            const float px = static_cast<float>(static_cast<double>(key) / 1e8);
+            const int bucket = lob_bucket(px, mid, is_ask);
+            if (bucket < 0)
+                return;
+            ofi[bucket] += is_ask ? -dqty : dqty;
+        };
+
+        for (const auto& kv : a)
+        {
+            const auto it = b.find(kv.first);
+            acc(kv.first, (it == b.end() ? 0.f : it->second) - kv.second);
+        }
+        for (const auto& kv : b)
+        {
+            if (!a.count(kv.first))
+                acc(kv.first, kv.second);
+        }
+    }
 }
 
 Progressiv::Progressiv()
@@ -111,6 +211,8 @@ void Progressiv::destroy()
         signal_thread_.join();
     if (exec_thread_.joinable())
         exec_thread_.join();
+    if (enable_training_capture)
+        flush_lob_bin();
     async_log::instance().stop();
 }
 
@@ -148,7 +250,7 @@ void Progressiv::init()
     load_app_cfg(loader::load_file("app.cfg"));
     if (use_testnet) interface_->init("demo_credential.cfg");
     else interface_->init("credential.cfg");
-    interface_->start(30);
+    interface_->start(20);
     script->set_controller(this);
     script->init(interface_->signal_symbol());
     if (interface_->split_trade_market())
@@ -172,13 +274,18 @@ void Progressiv::signal_loop()
                 break;
 
             const auto compute_t0 = std::chrono::steady_clock::now();
-            transaction_time = format_ms_timestamp(current_orderbook.transact_time);
-            message_time = format_ms_timestamp(current_orderbook.message_time);
             current_tick = current_orderbook.last_update_id;
-            asks = current_orderbook.asks;
-            bids = current_orderbook.bids;
-            script->set_asks(asks);
-            script->set_bids(bids);
+            std::string day;
+            if (enable_training_capture)
+            {
+                transaction_time = format_ms_timestamp(current_orderbook.transact_time);
+                message_time = format_ms_timestamp(current_orderbook.message_time);
+                day = (message_time.size() >= 8) ? message_time.substr(0, 8) : std::string{};
+                capture_lob_grid(day, current_orderbook);
+            }
+            // 直接 move，避免 asks/bids 二次拷贝；lob 必须在 move 之前写完
+            script->set_asks(std::move(current_orderbook.asks));
+            script->set_bids(std::move(current_orderbook.bids));
             script->run_signal();
             const auto compute_us = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - compute_t0).count();
@@ -189,11 +296,11 @@ void Progressiv::signal_loop()
             async_log::instance().set_loop_metrics(
                 exch_lag_ms,
                 static_cast<double>(wait_us) / 1000.0,
-                static_cast<double>(compute_us) / 1000.0);
+                static_cast<double>(compute_us) / 1000.0,
+                script->latest_signal().T);
 
             if (enable_training_capture)
             {
-                const std::string day = (message_time.size() >= 8) ? message_time.substr(0, 8) : std::string{};
                 capture_signal_sample(day);
                 if (interface_->split_trade_market())
                     capture_trade_sample(day, message_time);
@@ -212,20 +319,24 @@ void Progressiv::signal_loop()
 void Progressiv::execution_loop()
 {
     uint64_t last_seq = 0;
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+#endif
     while (running_)
     {
         try
         {
-            if (!script->wait_for_signal(last_seq, 200))
+            signal_snapshot snap;
+            if (!script->wait_take_signal(last_seq, snap, 50))
                 continue;
-            script->run_execution();
+            // 暂时不跑 run_execution：只算因子 / 落盘
         }
         catch (const std::exception& e)
         {
             async_log::instance().error(std::string("exec loop: ") + e.what());
             if (!running_)
                 break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
     }
 }
@@ -256,10 +367,76 @@ void Progressiv::capture_signal_sample(const std::string& day)
          << ",\"mid_price\":" << o.mid_price
          << ",\"ml_ofi_5s\":" << o.ml_ofi_5s
          << ",\"ml_ofi_15s\":" << o.ml_ofi_15s
+         << ",\"ml_ofi_30s\":" << o.ml_ofi_30s
+         << ",\"ml_ofi_60s\":" << o.ml_ofi_60s
          << ",\"n_mid_moves_30s\":" << o.n_mid_moves_30s
          << ",\"n_mid_moves_60s\":" << o.n_mid_moves_60s
          << ",\"rv_30s\":" << o.rv_30s
          << ",\"rv_60s\":" << o.rv_60s
+         << ",\"aggressor_imb_5s\":" << o.aggressor_imb_5s
+         << ",\"d_ask_10bp\":" << o.d_ask_10bp
+         << ",\"d_bid_10bp\":" << o.d_bid_10bp
+         << ",\"d_imb_10bp\":" << o.d_imb_10bp
+         << ",\"cover_ask_10bp\":" << o.cover_ask_10bp
+         << ",\"cover_bid_10bp\":" << o.cover_bid_10bp
+         << ",\"r_ask\":" << o.r_ask
+         << ",\"r_bid\":" << o.r_bid
+         << ",\"t_clear_ask\":" << o.t_clear_ask
+         << ",\"t_clear_bid\":" << o.t_clear_bid
+         << ",\"t_clear_ask_h\":" << o.t_clear_ask_h
+         << ",\"t_clear_bid_h\":" << o.t_clear_bid_h
+         << ",\"d_ask_chg_1s\":" << o.d_ask_chg_1s
+         << ",\"d_bid_chg_1s\":" << o.d_bid_chg_1s
+         << ",\"gap_ask\":" << o.gap_ask
+         << ",\"gap_bid\":" << o.gap_bid
+         << ",\"gap_max_ask\":" << o.gap_max_ask
+         << ",\"gap_max_bid\":" << o.gap_max_bid
+         << ",\"gap_imb\":" << o.gap_imb
+         << ",\"bid_slope\":" << o.bid_slope
+         << ",\"ask_slope\":" << o.ask_slope
+         << ",\"slope_imb\":" << o.slope_imb
+         << ",\"refill_ask_50ms\":" << o.refill_ask_50ms
+         << ",\"refill_ask_100ms\":" << o.refill_ask_100ms
+         << ",\"refill_ask_250ms\":" << o.refill_ask_250ms
+         << ",\"refill_bid_50ms\":" << o.refill_bid_50ms
+         << ",\"refill_bid_100ms\":" << o.refill_bid_100ms
+         << ",\"refill_bid_250ms\":" << o.refill_bid_250ms
+         << ",\"hawkes_buy_mo\":" << o.hawkes_buy_mo
+         << ",\"hawkes_sell_mo\":" << o.hawkes_sell_mo
+         << ",\"hawkes_ask_add\":" << o.hawkes_ask_add
+         << ",\"hawkes_bid_add\":" << o.hawkes_bid_add
+         << ",\"hawkes_ask_cancel\":" << o.hawkes_ask_cancel
+         << ",\"hawkes_bid_cancel\":" << o.hawkes_bid_cancel
+         << ",\"ml_ofi_250ms\":" << o.ml_ofi_250ms
+         << ",\"ml_ofi_1s\":" << o.ml_ofi_1s
+         << ",\"ml_ofi_2s\":" << o.ml_ofi_2s
+         << ",\"ofi_tick\":" << o.ofi_tick
+         << ",\"l1_ofi_tick\":" << o.l1_ofi_tick
+         << ",\"ret_100ms\":" << o.ret_100ms
+         << ",\"ret_250ms\":" << o.ret_250ms
+         << ",\"ret_1s\":" << o.ret_1s
+         << ",\"ret_5s\":" << o.ret_5s
+         << ",\"aggressor_imb_250ms\":" << o.aggressor_imb_250ms
+         << ",\"aggressor_imb_1s\":" << o.aggressor_imb_1s
+         << ",\"aggressor_net_1s\":" << o.aggressor_net_1s
+         << ",\"last_trade_sign\":" << o.last_trade_sign
+         << ",\"last_trade_mid_bps\":" << o.last_trade_mid_bps
+         << ",\"last_trade_age_ms\":" << o.last_trade_age_ms
+         << ",\"sig_l1_imb\":" << o.sig_l1_imb
+         << ",\"sig_l3_imb\":" << o.sig_l3_imb
+         << ",\"sig_micro_off\":" << o.sig_micro_off
+         << ",\"sig_spread_ticks\":" << o.sig_spread_ticks
+         << ",\"hawkes_mo_imb\":" << o.hawkes_mo_imb
+         << ",\"hawkes_add_imb\":" << o.hawkes_add_imb
+         << ",\"hawkes_cancel_imb\":" << o.hawkes_cancel_imb
+         << ",\"r_imb\":" << o.r_imb
+         << ",\"d_chg_imb_1s\":" << o.d_chg_imb_1s
+         << ",\"refill_imb_100ms\":" << o.refill_imb_100ms
+         << ",\"cover_imb_10bp\":" << o.cover_imb_10bp
+         << ",\"exec_aggressor_imb_250ms\":" << o.exec_aggressor_imb_250ms
+         << ",\"exec_aggressor_imb_1s\":" << o.exec_aggressor_imb_1s
+         << ",\"basis\":" << o.basis
+         << ",\"basis_chg_1s\":" << o.basis_chg_1s
          << ",\"T\":" << o.T
          << ",\"alpha\":" << o.alpha
          << "}\n";
@@ -322,3 +499,68 @@ void Progressiv::capture_trade_sample(const std::string& day, const std::string&
     line << "}\n";
     append_jsonl(interface_->trade_symbol(), day, line.str());
 }
+
+void Progressiv::flush_lob_bin()
+{
+    if (lob_.bin_ms < 0 || lob_.day.empty() || !interface_)
+        return;
+    std::ostringstream line;
+    line << std::setprecision(9)
+         << "{\"timestamp\":\"" << format_ms_timestamp(lob_.bin_ms) << "\""
+         << ",\"t_unix_ms\":" << lob_.bin_ms
+         << ",\"grid_ms\":100"
+         << ",\"theta\":0.001"
+         << ",\"mid\":" << lob_.mid
+         << ",\"bucket_bp\":[1,2,5,10],";
+    append_farr(line, "vol_bid", lob_.vol_bid, kLobBuckets);
+    line << ',';
+    append_farr(line, "vol_ask", lob_.vol_ask, kLobBuckets);
+    line << ',';
+    append_farr(line, "ofi_bid", lob_.ofi_bid, kLobBuckets);
+    line << ',';
+    append_farr(line, "ofi_ask", lob_.ofi_ask, kLobBuckets);
+    line << "}\n";
+    append_lob_jsonl(interface_->signal_symbol(), lob_.day, line.str());
+}
+
+void Progressiv::capture_lob_grid(const std::string& day, const orderbook_info& book)
+{
+    if (book.bids.empty() || book.asks.empty() || day.empty())
+        return;
+    const float mid = 0.5f * (book.bids[0].price + book.asks[0].price);
+    const long long now = book.message_time > 0 ? book.message_time : book.transact_time;
+    if (now <= 0 || !(mid > 0.f))
+        return;
+
+    constexpr long long kGrid = 100;
+    const long long bin = (now / kGrid) * kGrid;
+
+    float d_ofi_b[kLobBuckets]{};
+    float d_ofi_a[kLobBuckets]{};
+    if (lob_.has_prev)
+    {
+        lob_ofi_side(lob_.prev_bids, book.bids, mid, false, d_ofi_b);
+        lob_ofi_side(lob_.prev_asks, book.asks, mid, true, d_ofi_a);
+    }
+
+    if (lob_.bin_ms >= 0 && bin != lob_.bin_ms)
+    {
+        flush_lob_bin();
+        for (int i = 0; i < kLobBuckets; ++i)
+            lob_.ofi_bid[i] = lob_.ofi_ask[i] = 0.f;
+    }
+
+    lob_.bin_ms = bin;
+    lob_.day = day;
+    lob_.mid = mid;
+    for (int i = 0; i < kLobBuckets; ++i)
+    {
+        lob_.ofi_bid[i] += d_ofi_b[i];
+        lob_.ofi_ask[i] += d_ofi_a[i];
+    }
+    lob_vol(book.bids, book.asks, mid, lob_.vol_bid, lob_.vol_ask);
+    lob_.prev_bids = book.bids;
+    lob_.prev_asks = book.asks;
+    lob_.has_prev = true;
+}
+

@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 4.2)
+cmake_minimum_required(VERSION 3.16)
 project(Progressiv)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -7,6 +7,7 @@ add_executable(Progressiv main.cpp
         src/Progressiv.cpp
         src/loader.cpp
         src/Binance_interface.cpp
+        src/net_transport.cpp
         src/ed25519.cpp
         src/orderbook_script.cpp
         src/script.cpp
@@ -19,7 +20,6 @@ if (WIN32)
     if (MINGW)
         target_link_libraries(Progressiv PRIVATE pthread)
 
-        # MinGW 运行时 DLL：构建后自动拷到 exe 同目录
         get_filename_component(MINGW_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
         set(PROGRESSIV_MINGW_RUNTIME_DLLS
                 libstdc++-6.dll
@@ -42,4 +42,9 @@ if (WIN32)
                     COMMENT "Copying MinGW runtime DLLs next to Progressiv.exe")
         endif ()
     endif ()
+else ()
+    find_package(CURL REQUIRED)
+    find_package(OpenSSL REQUIRED)
+    find_package(Threads REQUIRED)
+    target_link_libraries(Progressiv PRIVATE CURL::libcurl OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
 endif ()

@@ -50,5 +50,23 @@ private:
     void execution_loop();
     void capture_signal_sample(const std::string& day);
     void capture_trade_sample(const std::string& day, const std::string& signal_timestamp);
+    void capture_lob_grid(const std::string& day, const orderbook_info& book);
+    void flush_lob_bin();
+
+    // DeepLOB：用 WS 20 档，100ms 网格、相对 mid 的 1/2/5/10bp 桶
+    struct lob_acc
+    {
+        long long bin_ms = -1;
+        float mid = 0.f;
+        float vol_bid[4]{};
+        float vol_ask[4]{};
+        float ofi_bid[4]{};
+        float ofi_ask[4]{};
+        bool has_prev = false;
+        std::string day;
+        std::vector<orderbook_level> prev_bids;
+        std::vector<orderbook_level> prev_asks;
+    };
+    lob_acc lob_{};
 };
 #endif

@@ -24,7 +24,7 @@ public:
 
     // 指标：热路径更新，IO 线程按 interval 打印
     // wait_ms = 等下一帧盘口；compute_ms = 真正算信号
-    void set_loop_metrics(long long exch_lag_ms, double wait_ms, double compute_ms);
+    void set_loop_metrics(long long exch_lag_ms, double wait_ms, double compute_ms, float T = 0.f);
     void set_metrics_interval_ms(long long ms) { metrics_interval_ms_ = ms; }
 
 private:
@@ -53,9 +53,10 @@ private:
     long long exch_lag_ms_ = -1;
     double wait_ms_ = 0.0;
     double compute_ms_ = 0.0;
+    float T_ = 0.f;
     long long metrics_seq_ = 0;
     long long last_metrics_print_seq_ = 0;
-    long long metrics_interval_ms_ = 1000;
+    long long metrics_interval_ms_ = 0; // 0 = 每圈都打（含 T）
     long long last_metrics_print_ms_ = 0;
 };
 

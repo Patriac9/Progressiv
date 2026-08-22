@@ -30,6 +30,8 @@ struct orderbook_info
 {
     std::string symbol;
     long long last_update_id = 0;
+    long long first_update_id = 0; // WS 增量 U（partial 流通常为 0）
+    long long prev_update_id = 0;  // WS 增量 pu
     long long transact_time = 0;
     long long message_time = 0;
     std::vector<orderbook_level> bids;
@@ -134,6 +136,7 @@ public:
     static std::pair<std::string, std::string> parse_inst_id(const std::string& content);
 
     // 启动三路长连接线程：行情 / 余额 / 订单
+    // 盘口只用 WS partial：@depth5/10/20@0ms（>20 钳成 20，不走 REST）
     void start(uint32_t depth_levels = 20);
     void stop();
 
@@ -150,7 +153,7 @@ public:
     // 读资金费率缓存（markPrice 流；不阻塞等待新包）
     funding_info get_ws_funding_rate();
     // 读主动成交流（aggTrade 滚动窗口汇总）
-    aggressor_flow get_ws_aggressor_flow(long long window_ms = 1000);
+    aggressor_flow get_ws_aggressor_flow(long long window_ms = 1000, bool trade_market = false);
     // 经余额线程长连接发起 account.status
     std::vector<asset_balance> get_ws_balance(bool omit_zero_balances = true);
 
@@ -175,6 +178,12 @@ public:
     std::vector<order_info> ws_open_orders(std::string symbol = {});
     // USD-M 合约：持仓（account.position，带短缓存）；only_open=true 时过滤 |positionAmt|>0
     std::vector<position_info> ws_get_positions(std::string symbol = {}, bool only_open = true);
+    // 热路径：只读本地缓存，绝不发起 account.position（由脏标记异步刷新）
+    std::vector<position_info> ws_peek_positions(std::string symbol = {}, bool only_open = true);
+    void refresh_positions_if_dirty(std::string symbol = {}, bool only_open = true);
+    void invalidate_positions_cache();
+    // User Data Stream ACCOUNT_UPDATE → 立刻改本地持仓缓存（避免 peek 仍空而同向再开仓）
+    void apply_account_update(const std::string& msg);
     // USD-M 合约：取消单笔挂单（order.cancel）
     order_info ws_cancel_order(long long order_id, std::string symbol = {});
     order_info ws_cancel_order(const std::string& client_order_id, std::string symbol = {});
@@ -183,6 +192,7 @@ public:
     // 从本地挂单缓存移除（订单已成交/不存在时用）
     void forget_open_order(long long order_id);
     static bool is_missing_order_error(const std::string& message);
+    static bool is_reduce_only_rejected(const std::string& message);
     static long long now_ms();
 
 private:
@@ -221,7 +231,7 @@ private:
     order_info modify_order_ws(param_map cancel_id_params, order_request req);
     std::string ed25519_sign_base64(const std::string& message) const;
     std::string signed_ws_call(RpcChannel& channel, const std::string& method, param_map params) const;
-    std::string signed_fapi_rest(const wchar_t* http_method, const std::string& path, param_map params) const;
+    std::string signed_fapi_rest(const std::string& http_method, const std::string& path, param_map params) const;
     std::string resolve_symbol(std::string symbol) const;
 
     void upsert_open_order_cache(const order_info& order);
@@ -229,7 +239,6 @@ private:
     void replace_open_order_cache(std::vector<order_info> orders);
     std::vector<order_info> snapshot_open_order_cache(const std::string& symbol) const;
     void refresh_open_order_cache_rest(const std::string& symbol); // 仅启动时可选 bootstrap
-    void invalidate_positions_cache();
 
     static std::vector<asset_balance> parse_balances(const std::string& json, bool omit_zero);
     static orderbook_info parse_orderbook(const std::string& json, const std::string& symbol);
@@ -253,7 +262,9 @@ private:
     mutable std::string positions_cache_symbol_;
     mutable bool positions_cache_only_open_ = true;
     mutable long long positions_cache_ms_ = 0;
-    static constexpr long long kPositionsRefreshMs = 1000; // WS 持仓查询最多 1s 一次
+    mutable bool positions_dirty_ = true;
+    mutable bool positions_loaded_ = false;
+    static constexpr long long kPositionsRefreshMs = 1000; // 非热路径刷新间隔
 };
 
 #endif //PROGRESSIV_BINANCE_INTERFACE_H

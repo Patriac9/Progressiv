@@ -1,11 +1,8 @@
-model = vol_exp
-kind = exp
-intercept = -0.3878564951636524
-n_mid_moves_30s = 0.004402285893525718
-n_mid_moves_60s = 0.000344489379004119
-rv_30s = 0.037536719446513
-rv_60s = 0.001251043743166603
+model = rv60_linear
+kind = linear
+intercept = 0.3866105232234798
+rv_60s = 0.3816448133299763
 scale = 1
 clip_min = 0.05
-clip_max = 0.48
+clip_max = 0.54
 sl = opposite

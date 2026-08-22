@@ -3,10 +3,7 @@
 //
 
 #include "Binance_interface.h"
-
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <winhttp.h>
+#include "net_transport.h"
 
 #include <algorithm>
 #include <atomic>
@@ -32,16 +29,6 @@
 
 namespace
 {
-    std::wstring utf8_to_wide(const std::string& s)
-    {
-        if (s.empty())
-            return {};
-        const int size = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
-        std::wstring out(size, L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), out.data(), size);
-        return out;
-    }
-
     int b64_value(char c)
     {
         if (c >= 'A' && c <= 'Z')
@@ -464,11 +451,6 @@ namespace
         return order;
     }
 
-    std::string winerr(const char* what)
-    {
-        return std::string(what) + " (GetLastError=" + std::to_string(GetLastError()) + ")";
-    }
-
     std::string url_encode(const std::string& s)
     {
         static const char kHex[] = "0123456789ABCDEF";
@@ -486,125 +468,6 @@ namespace
             }
         }
         return out;
-    }
-
-    struct HttpsResult
-    {
-        DWORD status = 0;
-        std::string body;
-    };
-
-    HttpsResult https_call(
-        const std::string& host,
-        const std::wstring& method,
-        const std::string& path,
-        const std::wstring& extra_headers = {})
-    {
-        const std::wstring whost = utf8_to_wide(host);
-        const std::wstring wpath = utf8_to_wide(path);
-
-        HINTERNET session = WinHttpOpen(
-            L"Progressiv/1.0",
-            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-            WINHTTP_NO_PROXY_NAME,
-            WINHTTP_NO_PROXY_BYPASS,
-            0);
-        if (!session)
-            throw std::runtime_error(winerr("WinHttpOpen failed"));
-
-        DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
-#ifdef WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3
-        protocols |= WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
-#endif
-        WinHttpSetOption(session, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
-        WinHttpSetTimeouts(session, 10000, 10000, 15000, 15000);
-
-        HINTERNET connect = WinHttpConnect(session, whost.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
-        if (!connect)
-        {
-            WinHttpCloseHandle(session);
-            throw std::runtime_error(winerr("WinHttpConnect failed"));
-        }
-
-        HINTERNET request = WinHttpOpenRequest(
-            connect,
-            method.c_str(),
-            wpath.c_str(),
-            nullptr,
-            WINHTTP_NO_REFERER,
-            WINHTTP_DEFAULT_ACCEPT_TYPES,
-            WINHTTP_FLAG_SECURE);
-        if (!request)
-        {
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
-            throw std::runtime_error(winerr("WinHttpOpenRequest failed"));
-        }
-
-        LPCWSTR headers = extra_headers.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : extra_headers.c_str();
-        const DWORD header_len = extra_headers.empty() ? 0 : static_cast<DWORD>(-1);
-        if (!WinHttpSendRequest(request, headers, header_len, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
-            || !WinHttpReceiveResponse(request, nullptr))
-        {
-            WinHttpCloseHandle(request);
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
-            throw std::runtime_error(winerr("HTTPS request failed"));
-        }
-
-        DWORD status_code = 0;
-        DWORD status_size = sizeof(status_code);
-        WinHttpQueryHeaders(
-            request,
-            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            WINHTTP_HEADER_NAME_BY_INDEX,
-            &status_code,
-            &status_size,
-            WINHTTP_NO_HEADER_INDEX);
-
-        std::string body;
-        for (;;)
-        {
-            DWORD available = 0;
-            if (!WinHttpQueryDataAvailable(request, &available))
-                break;
-            if (available == 0)
-                break;
-
-            std::string chunk(available, '\0');
-            DWORD read = 0;
-            if (!WinHttpReadData(request, chunk.data(), available, &read))
-                break;
-            chunk.resize(read);
-            body += chunk;
-        }
-
-        WinHttpCloseHandle(request);
-        WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
-
-        HttpsResult result;
-        result.status = status_code;
-        result.body = std::move(body);
-        return result;
-    }
-
-    std::string https_get(const std::string& host, const std::string& path)
-    {
-        const auto result = https_call(host, L"GET", path);
-        if (result.status != 200)
-            throw std::runtime_error("HTTPS GET status " + std::to_string(result.status) + ": " + result.body);
-        return result.body;
-    }
-
-    HttpsResult https_api_key(
-        const std::string& host,
-        const std::wstring& method,
-        const std::string& path,
-        const std::string& api_key)
-    {
-        const std::wstring headers = L"X-MBX-APIKEY: " + utf8_to_wide(api_key) + L"\r\n";
-        return https_call(host, method, path, headers);
     }
 
     std::string extract_json_object(const std::string& json, const std::string& key)
@@ -680,136 +543,6 @@ namespace
         }
     }
 
-    struct WsHandles
-    {
-        HINTERNET session = nullptr;
-        HINTERNET connect = nullptr;
-        HINTERNET socket = nullptr;
-
-        void close()
-        {
-            if (socket)
-            {
-                WinHttpWebSocketClose(socket, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, nullptr, 0);
-                WinHttpCloseHandle(socket);
-                socket = nullptr;
-            }
-            if (connect)
-            {
-                WinHttpCloseHandle(connect);
-                connect = nullptr;
-            }
-            if (session)
-            {
-                WinHttpCloseHandle(session);
-                session = nullptr;
-            }
-        }
-    };
-
-    WsHandles ws_connect(const std::string& host, const std::string& path)
-    {
-        WsHandles h;
-        const std::wstring whost = utf8_to_wide(host);
-        const std::wstring wpath = utf8_to_wide(path);
-
-        h.session = WinHttpOpen(
-            L"Progressiv/1.0",
-            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-            WINHTTP_NO_PROXY_NAME,
-            WINHTTP_NO_PROXY_BYPASS,
-            0);
-        if (!h.session)
-            throw std::runtime_error(winerr("WinHttpOpen failed"));
-
-        DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
-#ifdef WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3
-        protocols |= WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
-#endif
-        WinHttpSetOption(h.session, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
-        // 解析/连接/发送/接收超时；接收超时用于行情流断线检测与重连
-        WinHttpSetTimeouts(h.session, 10000, 10000, 15000, 5000);
-
-        h.connect = WinHttpConnect(h.session, whost.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
-        if (!h.connect)
-        {
-            h.close();
-            throw std::runtime_error(winerr("WinHttpConnect failed"));
-        }
-
-        HINTERNET request = WinHttpOpenRequest(
-            h.connect,
-            L"GET",
-            wpath.c_str(),
-            nullptr,
-            WINHTTP_NO_REFERER,
-            WINHTTP_DEFAULT_ACCEPT_TYPES,
-            WINHTTP_FLAG_SECURE);
-        if (!request)
-        {
-            h.close();
-            throw std::runtime_error(winerr("WinHttpOpenRequest failed"));
-        }
-
-        if (!WinHttpSetOption(request, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0)
-            || !WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
-            || !WinHttpReceiveResponse(request, nullptr))
-        {
-            WinHttpCloseHandle(request);
-            h.close();
-            throw std::runtime_error(winerr("WebSocket handshake failed"));
-        }
-
-        h.socket = WinHttpWebSocketCompleteUpgrade(request, 0);
-        WinHttpCloseHandle(request);
-        if (!h.socket)
-        {
-            h.close();
-            throw std::runtime_error(winerr("WinHttpWebSocketCompleteUpgrade failed"));
-        }
-        return h;
-    }
-
-    void ws_send(HINTERNET socket, const std::string& msg)
-    {
-        const DWORD st = WinHttpWebSocketSend(
-            socket,
-            WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
-            reinterpret_cast<PVOID>(const_cast<char*>(msg.data())),
-            static_cast<DWORD>(msg.size()));
-        if (st != ERROR_SUCCESS)
-            throw std::runtime_error("WinHttpWebSocketSend failed (" + std::to_string(st) + ")");
-    }
-
-    std::string ws_recv(HINTERNET socket)
-    {
-        std::string response;
-        std::vector<BYTE> buffer(16 * 1024);
-        for (;;)
-        {
-            DWORD bytes_read = 0;
-            WINHTTP_WEB_SOCKET_BUFFER_TYPE buffer_type = WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE;
-            const DWORD st = WinHttpWebSocketReceive(
-                socket,
-                buffer.data(),
-                static_cast<DWORD>(buffer.size()),
-                &bytes_read,
-                &buffer_type);
-            if (st != ERROR_SUCCESS)
-                throw std::runtime_error("WinHttpWebSocketReceive failed (" + std::to_string(st) + ")");
-
-            if (buffer_type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE)
-                break;
-
-            response.append(reinterpret_cast<char*>(buffer.data()), bytes_read);
-            if (buffer_type == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE
-                || buffer_type == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE)
-            {
-                break;
-            }
-        }
-        return response;
-    }
 }
 
 struct binance_interface::RpcChannel
@@ -879,7 +612,7 @@ struct binance_interface::RpcChannel
         {
             try
             {
-                WsHandles ws = ws_connect(host, path);
+                WsConnection ws = ws_connect(host, path);
                 while (running)
                 {
                     Job job;
@@ -898,11 +631,11 @@ struct binance_interface::RpcChannel
 
                     try
                     {
-                        ws_send(ws.socket, job.request);
+                        ws_send(ws, job.request);
                         std::string response;
                         for (;;)
                         {
-                            response = ws_recv(ws.socket);
+                            response = ws_recv(ws);
                             if (response.empty())
                                 throw std::runtime_error("Empty RPC response");
                             const bool has_id = response.find("\"id\"") != std::string::npos;
@@ -940,7 +673,6 @@ struct binance_interface::RpcChannel
 struct binance_interface::MarketChannel
 {
     std::string host;
-    std::string rest_host;
     std::string symbol;
     uint32_t levels = 20;
     std::atomic<bool> running{false};
@@ -952,10 +684,9 @@ struct binance_interface::MarketChannel
     uint64_t generation_ = 0;
     uint64_t last_consumed_gen_ = 0;
 
-    void start(std::string h, std::string rest_h, std::string sym, uint32_t depth_levels)
+    void start(std::string h, std::string sym, uint32_t depth_levels)
     {
         host = std::move(h);
-        rest_host = std::move(rest_h);
         symbol = std::move(sym);
         levels = (depth_levels <= 5) ? 5 : (depth_levels <= 10) ? 10 : 20;
         if (running.exchange(true))
@@ -1015,30 +746,16 @@ struct binance_interface::MarketChannel
         std::string stream_symbol = symbol;
         std::transform(stream_symbol.begin(), stream_symbol.end(), stream_symbol.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        // USD-M: payload 使用 b/a（不是现货 bids/asks）
         const std::string path = "/ws/" + stream_symbol + "@depth" + std::to_string(levels) + "@0ms";
-
-        // REST 快照先解阻塞，避免 WS 首包/解析异常时主线程一直等
-        try
-        {
-            const std::string rest_path =
-                "/fapi/v1/depth?symbol=" + symbol + "&limit=" + std::to_string(levels);
-            const std::string json = https_get(rest_host, rest_path);
-            publish(binance_interface::parse_orderbook(json, symbol));
-        }
-        catch (const std::exception& e)
-        {
-            std::cerr << "MarketChannel REST depth bootstrap failed: " << e.what() << std::endl;
-        }
 
         while (running)
         {
             try
             {
-                WsHandles ws = ws_connect(host, path);
+                WsConnection ws = ws_connect(host, path);
                 while (running)
                 {
-                    const std::string msg = ws_recv(ws.socket);
+                    const std::string msg = ws_recv(ws);
                     if (msg.empty())
                         break;
 
@@ -1097,7 +814,7 @@ struct binance_interface::UserDataChannel
 
     std::string create_listen_key()
     {
-        const auto result = https_api_key(rest_host, L"POST", "/fapi/v1/listenKey", api_key);
+        const auto result = https_api_key(rest_host, "POST", "/fapi/v1/listenKey", api_key);
         if (result.status != 200)
             throw std::runtime_error("listenKey create failed: " + result.body);
         const std::string key = extract_json_string(result.body, "listenKey");
@@ -1108,7 +825,7 @@ struct binance_interface::UserDataChannel
 
     void keepalive_listen_key(const std::string& key)
     {
-        const auto result = https_api_key(rest_host, L"PUT", "/fapi/v1/listenKey", api_key);
+        const auto result = https_api_key(rest_host, "PUT", "/fapi/v1/listenKey", api_key);
         if (result.status != 200)
             throw std::runtime_error("listenKey keepalive failed: " + result.body);
         (void)key;
@@ -1118,7 +835,7 @@ struct binance_interface::UserDataChannel
     {
         try
         {
-            https_api_key(rest_host, L"DELETE", "/fapi/v1/listenKey", api_key);
+            https_api_key(rest_host, "DELETE", "/fapi/v1/listenKey", api_key);
         }
         catch (...)
         {
@@ -1142,7 +859,7 @@ struct binance_interface::UserDataChannel
         }
         else if (event == "ACCOUNT_UPDATE")
         {
-            owner->invalidate_positions_cache();
+            owner->apply_account_update(msg);
         }
         else if (event == "listenKeyExpired")
         {
@@ -1154,7 +871,7 @@ struct binance_interface::UserDataChannel
 
     void run_session(const std::string& path, const std::string& key, long long& last_keepalive_ms)
     {
-        WsHandles ws = ws_connect(stream_host, path);
+        WsConnection ws = ws_connect(stream_host, path);
         last_keepalive_ms = binance_interface::now_ms();
         std::cerr << "UserDataChannel connected: " << path << '\n';
 
@@ -1173,7 +890,10 @@ struct binance_interface::UserDataChannel
                     break;
             }
 
-            const std::string msg = ws_recv(ws.socket);
+            bool timed_out = false;
+            const std::string msg = ws_recv(ws, &timed_out);
+            if (timed_out)
+                continue;
             if (msg.empty())
                 break;
             handle_message(msg);
@@ -1299,10 +1019,10 @@ struct binance_interface::FundingChannel
         {
             try
             {
-                WsHandles ws = ws_connect(host, path);
+                WsConnection ws = ws_connect(host, path);
                 while (running)
                 {
-                    const std::string msg = ws_recv(ws.socket);
+                    const std::string msg = ws_recv(ws);
                     if (msg.empty())
                         break;
                     publish(binance_interface::parse_funding(msg, symbol));
@@ -1425,10 +1145,10 @@ struct binance_interface::AggTradeChannel
         {
             try
             {
-                WsHandles ws = ws_connect(host, path);
+                WsConnection ws = ws_connect(host, path);
                 while (running)
                 {
-                    const std::string msg = ws_recv(ws.socket);
+                    const std::string msg = ws_recv(ws);
                     if (msg.empty())
                         break;
                     push(binance_interface::parse_agg_trade(msg, symbol));
@@ -1541,7 +1261,7 @@ void binance_interface::start(uint32_t depth_levels)
     order_channel_->start(ws_api_host_);
     futures_channel_->start(ws_fapi_host_, "/ws-fapi/v1");
     const std::string rest_host = use_testnet_ ? "testnet.binancefuture.com" : "fapi.binance.com";
-    market_channel_->start(ws_stream_host_, rest_host, signal_symbol_, depth_levels);
+    market_channel_->start(ws_stream_host_, signal_symbol_, depth_levels);
     funding_channel_->start(ws_stream_host_, rest_host, signal_symbol_);
     agg_trade_channel_->start(ws_stream_host_, signal_symbol_);
 
@@ -1549,7 +1269,7 @@ void binance_interface::start(uint32_t depth_levels)
     {
         trade_market_channel_ = std::make_unique<MarketChannel>();
         trade_agg_trade_channel_ = std::make_unique<AggTradeChannel>();
-        trade_market_channel_->start(ws_stream_host_, rest_host, trade_symbol_, depth_levels);
+        trade_market_channel_->start(ws_stream_host_, trade_symbol_, depth_levels);
         trade_agg_trade_channel_->start(ws_stream_host_, trade_symbol_);
     }
 
@@ -1696,11 +1416,14 @@ funding_info binance_interface::get_ws_funding_rate()
     return funding_channel_->get_latest();
 }
 
-aggressor_flow binance_interface::get_ws_aggressor_flow(long long window_ms)
+aggressor_flow binance_interface::get_ws_aggressor_flow(long long window_ms, bool trade_market)
 {
-    if (!agg_trade_channel_)
+    AggTradeChannel* channel = (trade_market && trade_agg_trade_channel_)
+        ? trade_agg_trade_channel_.get()
+        : agg_trade_channel_.get();
+    if (!channel)
         throw std::runtime_error("aggTrade channel not started; call start() first");
-    return agg_trade_channel_->get_flow(window_ms);
+    return channel->get_flow(window_ms);
 }
 
 std::vector<asset_balance> binance_interface::get_ws_balance(bool omit_zero_balances)
@@ -1864,9 +1587,11 @@ std::vector<position_info> binance_interface::ws_get_positions(std::string symbo
     symbol = symbol.empty() ? std::string{} : resolve_symbol(std::move(symbol));
     {
         std::lock_guard lock(positions_mutex_);
-        if (positions_cache_ms_ > 0
+        if (positions_loaded_
+            && !positions_dirty_
             && positions_cache_symbol_ == symbol
             && positions_cache_only_open_ == only_open
+            && positions_cache_ms_ > 0
             && now_ms() - positions_cache_ms_ < kPositionsRefreshMs)
         {
             return positions_cache_;
@@ -1886,8 +1611,140 @@ std::vector<position_info> binance_interface::ws_get_positions(std::string symbo
         positions_cache_symbol_ = symbol;
         positions_cache_only_open_ = only_open;
         positions_cache_ms_ = now_ms();
+        positions_loaded_ = true;
+        positions_dirty_ = false;
     }
     return positions;
+}
+
+std::vector<position_info> binance_interface::ws_peek_positions(std::string symbol, bool only_open)
+{
+    symbol = symbol.empty() ? std::string{} : resolve_symbol(std::move(symbol));
+    {
+        std::lock_guard lock(positions_mutex_);
+        if (positions_loaded_
+            && !positions_dirty_
+            && positions_cache_symbol_ == symbol
+            && positions_cache_only_open_ == only_open)
+        {
+            return positions_cache_;
+        }
+        // 脏且缓存里已有仓：先返回旧仓（禁止误判空仓再开同向单）；数量稍后刷新
+        if (positions_loaded_
+            && positions_dirty_
+            && positions_cache_symbol_ == symbol
+            && positions_cache_only_open_ == only_open)
+        {
+            for (const auto& p : positions_cache_)
+            {
+                if (std::fabs(p.position_amt) > 1e-12f)
+                    return positions_cache_;
+            }
+        }
+    }
+    // 首次无缓存，或脏且缓存显示空仓：必须同步拉，避免成交后仍以为空仓而连开
+    return ws_get_positions(std::move(symbol), only_open);
+}
+
+void binance_interface::refresh_positions_if_dirty(std::string symbol, bool only_open)
+{
+    bool dirty = false;
+    {
+        std::lock_guard lock(positions_mutex_);
+        dirty = positions_dirty_ || !positions_loaded_;
+    }
+    if (!dirty)
+        return;
+    try
+    {
+        ws_get_positions(std::move(symbol), only_open);
+    }
+    catch (...)
+    {
+        // 刷新失败保留旧缓存，下一 tick 再试
+    }
+}
+
+void binance_interface::invalidate_positions_cache()
+{
+    std::lock_guard lock(positions_mutex_);
+    positions_dirty_ = true;
+    positions_cache_ms_ = 0;
+}
+
+void binance_interface::apply_account_update(const std::string& msg)
+{
+    const std::string account = extract_json_object(msg, "a");
+    if (account.empty())
+    {
+        invalidate_positions_cache();
+        return;
+    }
+
+    const auto pos_objs = extract_json_object_array(account, "P");
+    if (pos_objs.empty())
+    {
+        // 无持仓字段时仍标脏，下一 tick 拉 account.position
+        invalidate_positions_cache();
+        return;
+    }
+
+    std::lock_guard lock(positions_mutex_);
+    if (!positions_loaded_)
+    {
+        positions_dirty_ = true;
+        positions_cache_ms_ = 0;
+        return;
+    }
+
+    for (const auto& obj : pos_objs)
+    {
+        const std::string sym = extract_json_string(obj, "s");
+        if (sym.empty())
+            continue;
+        if (!positions_cache_symbol_.empty() && sym != positions_cache_symbol_)
+            continue;
+
+        const float pa = extract_json_float(obj, "pa");
+        const float ep = extract_json_float(obj, "ep");
+        const float up = extract_json_float(obj, "up");
+        const std::string ps = extract_json_string(obj, "ps");
+
+        const auto it = std::find_if(
+            positions_cache_.begin(),
+            positions_cache_.end(),
+            [&](const position_info& p) { return p.symbol == sym; });
+
+        if (std::fabs(pa) < 1e-12f)
+        {
+            if (it != positions_cache_.end())
+                positions_cache_.erase(it);
+            continue;
+        }
+
+        if (it != positions_cache_.end())
+        {
+            it->position_amt = pa;
+            if (ep != 0.f)
+                it->entry_price = ep;
+            it->unrealized_profit = up;
+            if (!ps.empty())
+                it->position_side = ps;
+        }
+        else if (!positions_cache_only_open_ || std::fabs(pa) > 1e-12f)
+        {
+            position_info pos;
+            pos.symbol = sym;
+            pos.position_amt = pa;
+            pos.entry_price = ep;
+            pos.unrealized_profit = up;
+            pos.position_side = ps.empty() ? "BOTH" : ps;
+            positions_cache_.push_back(std::move(pos));
+        }
+    }
+
+    positions_dirty_ = false;
+    positions_cache_ms_ = now_ms();
 }
 
 order_info binance_interface::ws_cancel_order(long long order_id, std::string symbol)
@@ -1967,7 +1824,7 @@ std::vector<order_info> binance_interface::ws_cancel_all_open_orders(std::string
     param_map params;
     params["symbol"] = sym;
 
-    const std::string response = signed_fapi_rest(L"DELETE", "/fapi/v1/allOpenOrders", std::move(params));
+    const std::string response = signed_fapi_rest("DELETE", "/fapi/v1/allOpenOrders", std::move(params));
     std::vector<order_info> cancelled;
     if (!response.empty() && response.front() == '[')
         cancelled = parse_open_orders(response);
@@ -2005,15 +1862,15 @@ bool binance_interface::is_missing_order_error(const std::string& message)
         || message.find("Unknown order sent") != std::string::npos;
 }
 
+bool binance_interface::is_reduce_only_rejected(const std::string& message)
+{
+    return message.find("\"code\":-2022") != std::string::npos
+        || message.find("ReduceOnly Order is rejected") != std::string::npos;
+}
+
 void binance_interface::forget_open_order(long long order_id)
 {
     erase_open_order_cache(order_id);
-}
-
-void binance_interface::invalidate_positions_cache()
-{
-    std::lock_guard lock(positions_mutex_);
-    positions_cache_ms_ = 0;
 }
 
 void binance_interface::replace_open_order_cache(std::vector<order_info> orders)
@@ -2078,7 +1935,7 @@ void binance_interface::refresh_open_order_cache_rest(const std::string& symbol)
     param_map params;
     if (!symbol.empty())
         params["symbol"] = symbol;
-    const std::string response = signed_fapi_rest(L"GET", "/fapi/v1/openOrders", std::move(params));
+    const std::string response = signed_fapi_rest("GET", "/fapi/v1/openOrders", std::move(params));
     replace_open_order_cache(parse_open_orders(response));
 }
 
@@ -2105,6 +1962,8 @@ orderbook_info binance_interface::parse_orderbook(const std::string& json, const
     book.last_update_id = extract_json_int(payload, "lastUpdateId");
     if (book.last_update_id == 0)
         book.last_update_id = extract_json_int(payload, "u");
+    book.first_update_id = extract_json_int(payload, "U");
+    book.prev_update_id = extract_json_int(payload, "pu");
     book.transact_time = extract_json_int(payload, "T");
     if (book.transact_time == 0)
         book.transact_time = extract_json_int(payload, "transactTime");
@@ -2343,7 +2202,7 @@ std::string binance_interface::signed_ws_call(RpcChannel& channel, const std::st
     return channel.call(req_id, req.str());
 }
 
-std::string binance_interface::signed_fapi_rest(const wchar_t* http_method, const std::string& path, param_map params) const
+std::string binance_interface::signed_fapi_rest(const std::string& http_method, const std::string& path, param_map params) const
 {
     params["timestamp"] = std::to_string(now_ms());
 
@@ -2359,7 +2218,7 @@ std::string binance_interface::signed_fapi_rest(const wchar_t* http_method, cons
     const std::string signature = ed25519_sign_base64(payload);
     const std::string host = use_testnet_ ? "testnet.binancefuture.com" : "fapi.binance.com";
     const std::string full_path = path + "?" + payload + "&signature=" + url_encode(signature);
-    const std::wstring headers = L"X-MBX-APIKEY: " + utf8_to_wide(api_key_) + L"\r\n";
+    const std::string headers = "X-MBX-APIKEY: " + api_key_ + "\r\n";
 
     const auto result = https_call(host, http_method, full_path, headers);
 

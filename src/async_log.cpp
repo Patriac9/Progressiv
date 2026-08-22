@@ -60,12 +60,13 @@ void async_log::write_file(std::string path, std::string line)
     enqueue({kind::file, std::move(line), std::move(path)});
 }
 
-void async_log::set_loop_metrics(long long exch_lag_ms, double wait_ms, double compute_ms)
+void async_log::set_loop_metrics(long long exch_lag_ms, double wait_ms, double compute_ms, float T)
 {
     std::lock_guard lock(metrics_mu_);
     exch_lag_ms_ = exch_lag_ms;
     wait_ms_ = wait_ms;
     compute_ms_ = compute_ms;
+    T_ = T;
     ++metrics_seq_;
 }
 
@@ -118,23 +119,27 @@ void async_log::worker_loop()
         long long lag = -1;
         double wait_ms = 0.0;
         double compute_ms = 0.0;
+        float T = 0.f;
         long long seq = 0;
         {
             std::lock_guard lock(metrics_mu_);
             lag = exch_lag_ms_;
             wait_ms = wait_ms_;
             compute_ms = compute_ms_;
+            T = T_;
             seq = metrics_seq_;
         }
         const long long now = binance_interface::now_ms();
-        if (seq != last_metrics_print_seq_
-            && now - last_metrics_print_ms_ >= metrics_interval_ms_)
+        const bool due = (metrics_interval_ms_ <= 0)
+            || (now - last_metrics_print_ms_ >= metrics_interval_ms_);
+        if (seq != last_metrics_print_seq_ && due)
         {
             last_metrics_print_seq_ = seq;
             last_metrics_print_ms_ = now;
             std::cout << "exch_lag_ms=" << lag
                       << " wait_ms=" << wait_ms
-                      << " compute_ms=" << compute_ms << '\n';
+                      << " compute_ms=" << compute_ms
+                      << " T=" << T << '\n';
         }
     }
 
